@@ -127,6 +127,21 @@ pub fn Layer(comptime wt: WordType) type {
             };
         }
 
+        /// Bundles level pointers with caller context for common iteration.
+        /// - `Context` - caller-provided iteration context.
+        ///
+        /// Return - pairing struct passed to every step call.
+        pub fn LayersWithContext(comptime include_len: u32, comptime exclude_len: u32, Context: type) type {
+            return struct {
+                /// Levels whose states are ANDed, provide shared bounds.
+                includes: [include_len]*Self,
+                /// Levels whose states are ORed, provide exclusion lanes.
+                excludes: [exclude_len]*Self,
+                /// Caller context forwarded to per-bit callbacks.
+                context: Context,
+            };
+        }
+
         /// Builds a word-wise visitor that dispatches by four-state summary.
         pub fn Iterator(
             comptime Context: type,
@@ -264,6 +279,219 @@ pub fn Layer(comptime wt: WordType) type {
                     }
 
                     return true;
+                }
+            };
+        }
+
+        /// Builds a word-wise visitor that dispatches by common states.
+        pub fn CommonIterator(
+            comptime include_len: u32,
+            comptime exclude_len: u32,
+            comptime Context: type,
+            comptime on_inactive: InlineIteratorCallback(Context),
+            comptime on_active: InlineIteratorCallback(Context),
+            comptime on_mixed: IteratorCallback(Context),
+            comptime on_deep_mixed: InlineIteratorCallback(Context),
+        ) type {
+            return struct {
+                /// Visits one word and routes each valid bit to its state callback.
+                /// - `data` - levels and caller context.
+                /// - `word_id` - word index to scan.
+                ///
+                /// Return - false on early exit, true when the word completed.
+                pub inline fn step(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32) bool {
+                    if (include_len == 0 and exclude_len == 0) return true;
+                    if (on_inactive != null and on_active != null and on_mixed != null and on_deep_mixed != null) {
+                        return stepFull(data, word_id);
+                    } else {
+                        return stepPending(data, word_id);
+                    }
+                }
+
+                /// Fast path when all four callbacks exist, scans linearly by bound.
+                /// - `data` - levels and caller context.
+                /// - `word_id` - word index to scan.
+                ///
+                /// Return - false on early exit, true when the word completed.
+                inline fn stepFull(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32) bool {
+                    const first = if (include_len > 0) data.includes[0] else data.excludes[0];
+                    const context = data.context;
+                    std.debug.assert(word_id < first.activity.items.len);
+                    std.debug.assert(first.activity.items.len == first.mixed.items.len);
+                    const start = bw.wordToBitId(word_id);
+                    const inactive_mask = commonInactiveWord(data, word_id);
+                    const active_mask = commonActiveWord(data, word_id);
+                    const mixed_mask = commonMixedWord(data, word_id);
+                    const deep_mask = commonDeepWord(data, word_id);
+                    var bound: u32 = bw.word_type_bits;
+                    if (word_id == first.activity.items.len - 1) {
+                        const used = bw.bitIdInWord(first.bits_count);
+                        if (used != 0) bound = used;
+                    }
+                    var i: u32 = 0;
+                    while (i < bound) : (i += 1) {
+                        const bit_id = start + i;
+                        if (((inactive_mask >> @truncate(i)) & 1) != 0) {
+                            if (on_inactive) |f| {
+                                if (!f(context, bit_id)) return false;
+                            }
+                        } else if (((active_mask >> @truncate(i)) & 1) != 0) {
+                            if (on_active) |f| {
+                                if (!f(context, bit_id)) return false;
+                            }
+                        } else if (((mixed_mask >> @truncate(i)) & 1) != 0) {
+                            if (on_mixed) |f| {
+                                if (!f(context, bit_id)) return false;
+                            }
+                        } else if (((deep_mask >> @truncate(i)) & 1) != 0) {
+                            if (on_deep_mixed) |f| {
+                                if (!f(context, bit_id)) return false;
+                            }
+                        }
+                    }
+                    return true;
+                }
+
+                /// Selective path that peels only states with installed callbacks.
+                /// - `data` - levels and caller context.
+                /// - `word_id` - word index to scan.
+                ///
+                /// Return - false on early exit, true when the word completed.
+                inline fn stepPending(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32) bool {
+                    const first = if (include_len > 0) data.includes[0] else data.excludes[0];
+                    const context = data.context;
+                    std.debug.assert(word_id < first.activity.items.len);
+                    std.debug.assert(first.activity.items.len == first.mixed.items.len);
+                    const start = bw.wordToBitId(word_id);
+
+                    var mask: Word = bw.max_value;
+                    if (word_id == first.activity.items.len - 1) {
+                        const used = bw.bitIdInWord(first.bits_count);
+                        if (used != 0) mask = bw.maskStart(used);
+                    }
+
+                    const only_inactive_word = commonInactiveWord(data, word_id) & mask;
+                    const only_active_word = commonActiveWord(data, word_id) & mask;
+                    const only_mixed_word = commonMixedWord(data, word_id) & mask;
+                    const only_deep_mixed = commonDeepWord(data, word_id) & mask;
+
+                    var pending_word: Word = 0;
+                    if (on_inactive != null) pending_word |= only_inactive_word;
+                    if (on_active != null) pending_word |= only_active_word;
+                    if (on_mixed != null) pending_word |= only_mixed_word;
+                    if (on_deep_mixed != null) pending_word |= only_deep_mixed;
+
+                    while (pending_word != 0) {
+                        const bit_id_in_word: u32 = @ctz(pending_word);
+                        const bit_id = start + bit_id_in_word;
+                        const bit: Word = @as(Word, 1) << @truncate(bit_id_in_word);
+                        pending_word &= pending_word - 1;
+
+                        if (on_inactive) |f| {
+                            if ((only_inactive_word & bit) != 0) {
+                                if (!f(context, bit_id)) return false;
+                                continue;
+                            }
+                        }
+
+                        if (on_active) |f| {
+                            if ((only_active_word & bit) != 0) {
+                                if (!f(context, bit_id)) return false;
+                                continue;
+                            }
+                        }
+
+                        if (on_mixed) |f| {
+                            if ((only_mixed_word & bit) != 0) {
+                                if (!f(context, bit_id)) return false;
+                                continue;
+                            }
+                        }
+
+                        if (on_deep_mixed) |f| {
+                            if ((only_deep_mixed & bit) != 0) {
+                                if (!f(context, bit_id)) return false;
+                                continue;
+                            }
+                        }
+                    }
+
+                    return true;
+                }
+
+                /// Merges include and exclude lanes of one index into a shared inactive mask.
+                /// - `data` - levels and caller context.
+                /// - `word_id` - word index to merge.
+                ///
+                /// Return - lanes with all includes inactive, no excludes inactive and no mixed states.
+                inline fn commonInactiveWord(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32) Word {
+                    var include_mask: Word = bw.max_value;
+                    inline for (0..include_len) |k| {
+                        include_mask &= (~data.includes[k].activity.items[word_id]) & (~data.includes[k].mixed.items[word_id]);
+                    }
+                    var exclude_mask: Word = 0;
+                    inline for (0..exclude_len) |k| {
+                        exclude_mask |= (~data.excludes[k].activity.items[word_id]) & (~data.excludes[k].mixed.items[word_id]);
+                    }
+                    return include_mask & ~exclude_mask & ~commonNonterminalWord(data, word_id);
+                }
+
+                /// Merges include and exclude lanes of one index into a shared active mask.
+                /// - `data` - levels and caller context.
+                /// - `word_id` - word index to merge.
+                ///
+                /// Return - lanes with all includes active, no excludes active and no mixed states.
+                inline fn commonActiveWord(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32) Word {
+                    var include_mask: Word = bw.max_value;
+                    inline for (0..include_len) |k| {
+                        include_mask &= data.includes[k].activity.items[word_id] & (~data.includes[k].mixed.items[word_id]);
+                    }
+                    var exclude_mask: Word = 0;
+                    inline for (0..exclude_len) |k| {
+                        exclude_mask |= data.excludes[k].activity.items[word_id] & (~data.excludes[k].mixed.items[word_id]);
+                    }
+                    return include_mask & ~exclude_mask & ~commonNonterminalWord(data, word_id);
+                }
+
+                /// Merges every mixed plane of one index into a shared nonterminal mask.
+                /// - `data` - levels and caller context.
+                /// - `word_id` - word index to merge.
+                ///
+                /// Return - lanes with any mixed or deeply mixed state.
+                inline fn commonNonterminalWord(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32) Word {
+                    var nonterminal_mask: Word = 0;
+                    inline for (0..include_len) |k| {
+                        nonterminal_mask |= data.includes[k].mixed.items[word_id];
+                    }
+                    inline for (0..exclude_len) |k| {
+                        nonterminal_mask |= data.excludes[k].mixed.items[word_id];
+                    }
+                    return nonterminal_mask;
+                }
+
+                /// Merges every plane of one index into a shared mixed mask.
+                /// - `data` - levels and caller context.
+                /// - `word_id` - word index to merge.
+                ///
+                /// Return - lanes with any mixed state but no unanimous deep state.
+                inline fn commonMixedWord(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32) Word {
+                    return commonNonterminalWord(data, word_id) & ~commonDeepWord(data, word_id);
+                }
+
+                /// Merges every plane of one index into a shared deep mask.
+                /// - `data` - levels and caller context.
+                /// - `word_id` - word index to merge.
+                ///
+                /// Return - lanes with every include and exclude deeply mixed.
+                inline fn commonDeepWord(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32) Word {
+                    var deep_mask: Word = bw.max_value;
+                    inline for (0..include_len) |k| {
+                        deep_mask &= data.includes[k].activity.items[word_id] & data.includes[k].mixed.items[word_id];
+                    }
+                    inline for (0..exclude_len) |k| {
+                        deep_mask &= data.excludes[k].activity.items[word_id] & data.excludes[k].mixed.items[word_id];
+                    }
+                    return deep_mask;
                 }
             };
         }
@@ -861,4 +1089,940 @@ test "Layer step: early exit stops the walk" {
         try t.expect(!It.step(.{ .layer = &layer, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 1), ctx.ni + ctx.na + ctx.nm + ctx.nd);
     }
+}
+
+const CommonOrderStates = struct {
+    ids: [256]u32 = undefined,
+    tags: [256]u2 = undefined,
+    n: usize = 0,
+    stop_after: u32 = std.math.maxInt(u32),
+};
+
+inline fn commonOrderPushI(ctx: *CommonOrderStates, bit_id: u32) bool {
+    ctx.ids[ctx.n] = bit_id;
+    ctx.tags[ctx.n] = 0;
+    ctx.n += 1;
+    return ctx.n < ctx.stop_after;
+}
+
+inline fn commonOrderPushA(ctx: *CommonOrderStates, bit_id: u32) bool {
+    ctx.ids[ctx.n] = bit_id;
+    ctx.tags[ctx.n] = 1;
+    ctx.n += 1;
+    return ctx.n < ctx.stop_after;
+}
+
+fn commonOrderPushM(ctx: *CommonOrderStates, bit_id: u32) bool {
+    ctx.ids[ctx.n] = bit_id;
+    ctx.tags[ctx.n] = 2;
+    ctx.n += 1;
+    return ctx.n < ctx.stop_after;
+}
+
+inline fn commonOrderPushD(ctx: *CommonOrderStates, bit_id: u32) bool {
+    ctx.ids[ctx.n] = bit_id;
+    ctx.tags[ctx.n] = 3;
+    ctx.n += 1;
+    return ctx.n < ctx.stop_after;
+}
+
+fn commonStepCollect(
+    comptime wt: WordType,
+    comptime IL: u32,
+    comptime EL: u32,
+    comptime on_i: InlineIteratorCallback(*StepStates),
+    comptime on_a: InlineIteratorCallback(*StepStates),
+    comptime on_m: IteratorCallback(*StepStates),
+    comptime on_d: InlineIteratorCallback(*StepStates),
+    includes: [IL]*Layer(wt),
+    excludes: [EL]*Layer(wt),
+    ctx: *StepStates,
+) bool {
+    const It = Layer(wt).CommonIterator(IL, EL, *StepStates, on_i, on_a, on_m, on_d);
+    if (IL == 0 and EL == 0) return true;
+    const words_len = if (IL > 0) includes[0].activity.items.len else excludes[0].activity.items.len;
+    var wid: u32 = 0;
+    while (wid < words_len) : (wid += 1) {
+        if (!It.step(.{ .includes = includes, .excludes = excludes, .context = ctx }, wid)) return false;
+    }
+    return true;
+}
+
+fn commonStepCollectOrder(
+    comptime wt: WordType,
+    comptime IL: u32,
+    comptime EL: u32,
+    includes: [IL]*Layer(wt),
+    excludes: [EL]*Layer(wt),
+    ctx: *CommonOrderStates,
+) bool {
+    const It = Layer(wt).CommonIterator(IL, EL, *CommonOrderStates, commonOrderPushI, commonOrderPushA, commonOrderPushM, commonOrderPushD);
+    if (IL == 0 and EL == 0) return true;
+    const words_len = if (IL > 0) includes[0].activity.items.len else excludes[0].activity.items.len;
+    var wid: u32 = 0;
+    while (wid < words_len) : (wid += 1) {
+        if (!It.step(.{ .includes = includes, .excludes = excludes, .context = ctx }, wid)) return false;
+    }
+    return true;
+}
+
+fn commonOracleStates(
+    comptime wt: WordType,
+    comptime IL: u32,
+    comptime EL: u32,
+    includes: [IL]*Layer(wt),
+    excludes: [EL]*Layer(wt),
+    n: u32,
+    out: *[4][256]u32,
+) [4]usize {
+    const BW = bit_word.BitWord(wt);
+    var ns = [4]usize{ 0, 0, 0, 0 };
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const wid: usize = @intCast(BW.bitToWordId(i));
+        const in_w = BW.bitIdInWord(i);
+        var any_nt = false;
+        var all_deep = true;
+        var all_inc_a = true;
+        var all_inc_i = true;
+        var any_exc_a = false;
+        var any_exc_i = false;
+        for (includes) |layer| {
+            const a = BW.readBitState(layer.activity.items[wid], in_w);
+            const m = BW.readBitState(layer.mixed.items[wid], in_w);
+            if (m == .active) any_nt = true;
+            if (!(a == .active and m == .active)) all_deep = false;
+            if (!(a == .active and m == .inactive)) all_inc_a = false;
+            if (!(a == .inactive and m == .inactive)) all_inc_i = false;
+        }
+        for (excludes) |layer| {
+            const a = BW.readBitState(layer.activity.items[wid], in_w);
+            const m = BW.readBitState(layer.mixed.items[wid], in_w);
+            if (m == .active) any_nt = true;
+            if (!(a == .active and m == .active)) all_deep = false;
+            if (a == .active and m == .inactive) any_exc_a = true;
+            if (a == .inactive and m == .inactive) any_exc_i = true;
+        }
+        const s: usize = if (any_nt)
+            if (all_deep) 3 else 2
+        else if (all_inc_i and !any_exc_i)
+            0
+        else if (all_inc_a and !any_exc_a)
+            1
+        else
+            4;
+        if (s < 4) {
+            out[s][ns[s]] = i;
+            ns[s] += 1;
+        }
+    }
+    return ns;
+}
+
+fn commonPoisonPadding(
+    comptime wt: WordType,
+    comptime IL: u32,
+    comptime EL: u32,
+    includes: [IL]*Layer(wt),
+    excludes: [EL]*Layer(wt),
+    n: u32,
+) void {
+    if (n == 0) return;
+    const BW = bit_word.BitWord(wt);
+    const used = BW.bitIdInWord(n);
+    if (used == 0) return;
+    const valid = BW.maskStart(used);
+    for (includes) |layer| {
+        layer.activity.items[layer.activity.items.len - 1] |= ~valid;
+        layer.mixed.items[layer.mixed.items.len - 1] |= ~valid;
+    }
+    for (excludes) |layer| {
+        layer.activity.items[layer.activity.items.len - 1] |= ~valid;
+        layer.mixed.items[layer.mixed.items.len - 1] |= ~valid;
+    }
+}
+
+fn commonCheckOne(
+    comptime wt: WordType,
+    comptime IL: u32,
+    comptime EL: u32,
+    n: u32,
+    pats_inc: [IL]StepPattern,
+    pats_exc: [EL]StepPattern,
+) !void {
+    var inc_sets: [IL]Layer(wt) = undefined;
+    var exc_sets: [EL]Layer(wt) = undefined;
+    for (0..IL) |k| {
+        inc_sets[k] = .{};
+        try inc_sets[k].resize(t.allocator, n, .inactive);
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            layerSetState(wt, &inc_sets[k], i, @enumFromInt(@intFromEnum(patternState(pats_inc[k], i))));
+        }
+    }
+    for (0..EL) |k| {
+        exc_sets[k] = .{};
+        try exc_sets[k].resize(t.allocator, n, .inactive);
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            layerSetState(wt, &exc_sets[k], i, @enumFromInt(@intFromEnum(patternState(pats_exc[k], i))));
+        }
+    }
+    defer {
+        for (0..IL) |k| inc_sets[k].deinit(t.allocator);
+        for (0..EL) |k| exc_sets[k].deinit(t.allocator);
+    }
+    var inc_ptrs: [IL]*Layer(wt) = undefined;
+    var exc_ptrs: [EL]*Layer(wt) = undefined;
+    for (0..IL) |k| inc_ptrs[k] = &inc_sets[k];
+    for (0..EL) |k| exc_ptrs[k] = &exc_sets[k];
+    commonPoisonPadding(wt, IL, EL, inc_ptrs, exc_ptrs, n);
+
+    var exp: [4][256]u32 = undefined;
+    const ns = commonOracleStates(wt, IL, EL, inc_ptrs, exc_ptrs, n, &exp);
+
+    {
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(wt, IL, EL, stepPushI, stepPushA, stepPushM, stepPushD, inc_ptrs, exc_ptrs, &ctx));
+        try t.expectEqualSlices(u32, exp[0][0..ns[0]], ctx.inactive[0..ctx.ni]);
+        try t.expectEqualSlices(u32, exp[1][0..ns[1]], ctx.active[0..ctx.na]);
+        try t.expectEqualSlices(u32, exp[2][0..ns[2]], ctx.mixed[0..ctx.nm]);
+        try t.expectEqualSlices(u32, exp[3][0..ns[3]], ctx.deep[0..ctx.nd]);
+    }
+    {
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(wt, IL, EL, stepPushI, null, null, null, inc_ptrs, exc_ptrs, &ctx));
+        try t.expectEqualSlices(u32, exp[0][0..ns[0]], ctx.inactive[0..ctx.ni]);
+        try t.expectEqual(@as(usize, 0), ctx.na + ctx.nm + ctx.nd);
+    }
+    {
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(wt, IL, EL, null, stepPushA, null, null, inc_ptrs, exc_ptrs, &ctx));
+        try t.expectEqualSlices(u32, exp[1][0..ns[1]], ctx.active[0..ctx.na]);
+        try t.expectEqual(@as(usize, 0), ctx.ni + ctx.nm + ctx.nd);
+    }
+    {
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(wt, IL, EL, null, null, stepPushM, null, inc_ptrs, exc_ptrs, &ctx));
+        try t.expectEqualSlices(u32, exp[2][0..ns[2]], ctx.mixed[0..ctx.nm]);
+        try t.expectEqual(@as(usize, 0), ctx.ni + ctx.na + ctx.nd);
+    }
+    {
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(wt, IL, EL, null, null, null, stepPushD, inc_ptrs, exc_ptrs, &ctx));
+        try t.expectEqualSlices(u32, exp[3][0..ns[3]], ctx.deep[0..ctx.nd]);
+        try t.expectEqual(@as(usize, 0), ctx.ni + ctx.na + ctx.nm);
+    }
+    {
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(wt, IL, EL, stepPushI, stepPushA, null, null, inc_ptrs, exc_ptrs, &ctx));
+        try t.expectEqualSlices(u32, exp[0][0..ns[0]], ctx.inactive[0..ctx.ni]);
+        try t.expectEqualSlices(u32, exp[1][0..ns[1]], ctx.active[0..ctx.na]);
+        try t.expectEqual(@as(usize, 0), ctx.nm + ctx.nd);
+    }
+    {
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(wt, IL, EL, null, null, stepPushM, stepPushD, inc_ptrs, exc_ptrs, &ctx));
+        try t.expectEqualSlices(u32, exp[2][0..ns[2]], ctx.mixed[0..ctx.nm]);
+        try t.expectEqualSlices(u32, exp[3][0..ns[3]], ctx.deep[0..ctx.nd]);
+        try t.expectEqual(@as(usize, 0), ctx.ni + ctx.na);
+    }
+    for (0..4) |s| {
+        for (exp[s][0..ns[s]]) |id| try t.expect(id < n);
+    }
+}
+
+fn commonCheckOrder(
+    comptime wt: WordType,
+    comptime IL: u32,
+    comptime EL: u32,
+    n: u32,
+    pats_inc: [IL]StepPattern,
+    pats_exc: [EL]StepPattern,
+) !void {
+    var inc_sets: [IL]Layer(wt) = undefined;
+    var exc_sets: [EL]Layer(wt) = undefined;
+    for (0..IL) |k| {
+        inc_sets[k] = .{};
+        try inc_sets[k].resize(t.allocator, n, .inactive);
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            layerSetState(wt, &inc_sets[k], i, @enumFromInt(@intFromEnum(patternState(pats_inc[k], i))));
+        }
+    }
+    for (0..EL) |k| {
+        exc_sets[k] = .{};
+        try exc_sets[k].resize(t.allocator, n, .inactive);
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            layerSetState(wt, &exc_sets[k], i, @enumFromInt(@intFromEnum(patternState(pats_exc[k], i))));
+        }
+    }
+    defer {
+        for (0..IL) |k| inc_sets[k].deinit(t.allocator);
+        for (0..EL) |k| exc_sets[k].deinit(t.allocator);
+    }
+    var inc_ptrs: [IL]*Layer(wt) = undefined;
+    var exc_ptrs: [EL]*Layer(wt) = undefined;
+    for (0..IL) |k| inc_ptrs[k] = &inc_sets[k];
+    for (0..EL) |k| exc_ptrs[k] = &exc_sets[k];
+    commonPoisonPadding(wt, IL, EL, inc_ptrs, exc_ptrs, n);
+
+    var exp: [4][256]u32 = undefined;
+    const ns = commonOracleStates(wt, IL, EL, inc_ptrs, exc_ptrs, n, &exp);
+
+    var ctx = CommonOrderStates{};
+    try t.expect(commonStepCollectOrder(wt, IL, EL, inc_ptrs, exc_ptrs, &ctx));
+
+    var taken = [4]usize{ 0, 0, 0, 0 };
+    var prev: u32 = 0;
+    var k: usize = 0;
+    while (k < ctx.n) : (k += 1) {
+        const id = ctx.ids[k];
+        const tag: usize = ctx.tags[k];
+        if (k > 0) try t.expect(id > prev);
+        prev = id;
+        try t.expect(id < n);
+        try t.expect(taken[tag] < ns[tag]);
+        try t.expectEqual(exp[tag][taken[tag]], id);
+        taken[tag] += 1;
+    }
+    for (0..4) |s| try t.expectEqual(ns[s], taken[s]);
+}
+
+test "Layer CommonIterator: spec poles 1+1" {
+    var inc: Layer(.u8) = .{};
+    var exc: Layer(.u8) = .{};
+    defer inc.deinit(t.allocator);
+    defer exc.deinit(t.allocator);
+    try inc.resize(t.allocator, 4, .inactive);
+    try exc.resize(t.allocator, 4, .inactive);
+    layerSetState(.u8, &inc, 0, .inactive);
+    layerSetState(.u8, &inc, 1, .active);
+    layerSetState(.u8, &inc, 2, .mixed);
+    layerSetState(.u8, &inc, 3, .deep_mixed);
+    layerSetState(.u8, &exc, 0, .active);
+    layerSetState(.u8, &exc, 1, .inactive);
+    layerSetState(.u8, &exc, 2, .deep_mixed);
+    layerSetState(.u8, &exc, 3, .mixed);
+
+    const It = Layer(.u8).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+    var ctx = StepStates{};
+    try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
+    try t.expectEqualSlices(u32, &[_]u32{0}, ctx.inactive[0..ctx.ni]);
+    try t.expectEqualSlices(u32, &[_]u32{1}, ctx.active[0..ctx.na]);
+    try t.expectEqualSlices(u32, &[_]u32{ 2, 3 }, ctx.mixed[0..ctx.nm]);
+    try t.expectEqual(@as(usize, 0), ctx.nd);
+}
+
+test "Layer CommonIterator: 1+1 truth table" {
+    const all = [_]Layer(.u8).State{ .inactive, .active, .mixed, .deep_mixed };
+    for (all) |si| {
+        for (all) |se| {
+            var inc: Layer(.u8) = .{};
+            var exc: Layer(.u8) = .{};
+            defer inc.deinit(t.allocator);
+            defer exc.deinit(t.allocator);
+            try inc.resize(t.allocator, 1, .inactive);
+            try exc.resize(t.allocator, 1, .inactive);
+            layerSetState(.u8, &inc, 0, si);
+            layerSetState(.u8, &exc, 0, se);
+            const It = Layer(.u8).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+            var ctx = StepStates{};
+            try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
+            const si_nt = si == .mixed or si == .deep_mixed;
+            const se_nt = se == .mixed or se == .deep_mixed;
+            if (si_nt or se_nt) {
+                try t.expectEqual(@as(usize, 0), ctx.ni + ctx.na);
+                if (si == .deep_mixed and se == .deep_mixed) {
+                    try t.expectEqualSlices(u32, &[_]u32{0}, ctx.deep[0..ctx.nd]);
+                    try t.expectEqual(@as(usize, 0), ctx.nm);
+                } else {
+                    try t.expectEqualSlices(u32, &[_]u32{0}, ctx.mixed[0..ctx.nm]);
+                    try t.expectEqual(@as(usize, 0), ctx.nd);
+                }
+            } else if (si == .inactive and se == .active) {
+                try t.expectEqualSlices(u32, &[_]u32{0}, ctx.inactive[0..ctx.ni]);
+                try t.expectEqual(@as(usize, 0), ctx.na + ctx.nm + ctx.nd);
+            } else if (si == .active and se == .inactive) {
+                try t.expectEqualSlices(u32, &[_]u32{0}, ctx.active[0..ctx.na]);
+                try t.expectEqual(@as(usize, 0), ctx.ni + ctx.nm + ctx.nd);
+            } else {
+                try t.expectEqual(@as(usize, 0), ctx.total());
+            }
+        }
+    }
+}
+
+fn commonCheckSingleMatchesIterator(comptime wt: WordType, n: u32, pat: StepPattern) !void {
+    var layer: Layer(wt) = .{};
+    defer layer.deinit(t.allocator);
+    try layer.resize(t.allocator, n, .inactive);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        layerSetState(wt, &layer, i, @enumFromInt(@intFromEnum(patternState(pat, i))));
+    }
+    commonPoisonPadding(wt, 1, 0, .{&layer}, .{}, n);
+
+    var exp: [4][256]u32 = undefined;
+    const ns = stepOracleStates(wt, &layer, &exp);
+
+    var got = StepStates{};
+    try t.expect(commonStepCollect(wt, 1, 0, stepPushI, stepPushA, stepPushM, stepPushD, .{&layer}, .{}, &got));
+    const lists = [_][]const u32{
+        got.inactive[0..got.ni],
+        got.active[0..got.na],
+        got.mixed[0..got.nm],
+        got.deep[0..got.nd],
+    };
+    for (0..4) |s| try t.expectEqualSlices(u32, exp[s][0..ns[s]], lists[s]);
+
+    var ref = StepStates{};
+    var wid: u32 = 0;
+    const It = Layer(wt).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+    while (wid < layer.activity.items.len) : (wid += 1) {
+        if (!It.step(.{ .layer = &layer, .context = &ref }, wid)) break;
+    }
+    try t.expectEqualSlices(u32, ref.inactive[0..ref.ni], got.inactive[0..got.ni]);
+    try t.expectEqualSlices(u32, ref.active[0..ref.na], got.active[0..got.na]);
+    try t.expectEqualSlices(u32, ref.mixed[0..ref.nm], got.mixed[0..got.nm]);
+    try t.expectEqualSlices(u32, ref.deep[0..ref.nd], got.deep[0..got.nd]);
+}
+
+test "Layer CommonIterator: 1+0 matches Iterator" {
+    const sizes = [_]u32{ 0, 1, 2, 7, 8, 9, 15, 16, 17, 63, 64, 65, 70, 128, 129, 200 };
+    const patterns = [_]StepPattern{ .all_inactive, .all_active, .all_mixed, .all_deep, .cycle4, .sparse_deep, .pseudo };
+    for (sizes) |n| {
+        for (patterns) |pat| {
+            try commonCheckSingleMatchesIterator(.u64, n, pat);
+            try commonCheckSingleMatchesIterator(.u8, n, pat);
+        }
+    }
+}
+
+fn commonCheckSwappedDual(comptime wt: WordType, n: u32, pat: StepPattern) !void {
+    var layer: Layer(wt) = .{};
+    defer layer.deinit(t.allocator);
+    try layer.resize(t.allocator, n, .inactive);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        layerSetState(wt, &layer, i, @enumFromInt(@intFromEnum(patternState(pat, i))));
+    }
+    commonPoisonPadding(wt, 0, 1, .{}, .{&layer}, n);
+
+    var exp: [4][256]u32 = undefined;
+    const ns = stepOracleStates(wt, &layer, &exp);
+
+    var got = StepStates{};
+    try t.expect(commonStepCollect(wt, 0, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{}, .{&layer}, &got));
+    try t.expectEqualSlices(u32, exp[1][0..ns[1]], got.inactive[0..got.ni]);
+    try t.expectEqualSlices(u32, exp[0][0..ns[0]], got.active[0..got.na]);
+    try t.expectEqualSlices(u32, exp[2][0..ns[2]], got.mixed[0..got.nm]);
+    try t.expectEqualSlices(u32, exp[3][0..ns[3]], got.deep[0..got.nd]);
+}
+
+test "Layer CommonIterator: 0+1 swapped dual" {
+    const sizes = [_]u32{ 0, 1, 2, 7, 8, 9, 15, 16, 17, 63, 64, 65, 70, 128, 129, 200 };
+    const patterns = [_]StepPattern{ .all_inactive, .all_active, .all_mixed, .all_deep, .cycle4, .sparse_deep, .pseudo };
+    for (sizes) |n| {
+        for (patterns) |pat| {
+            try commonCheckSwappedDual(.u64, n, pat);
+            try commonCheckSwappedDual(.u8, n, pat);
+        }
+    }
+}
+
+test "Layer CommonIterator: all uniform and aliasing" {
+    for ([_]StepPattern{ .all_inactive, .all_active, .all_mixed, .all_deep }) |pat| {
+        var inc: Layer(.u64) = .{};
+        var exc: Layer(.u64) = .{};
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        try inc.resize(t.allocator, 70, .inactive);
+        try exc.resize(t.allocator, 70, .inactive);
+        var i: u32 = 0;
+        while (i < 70) : (i += 1) {
+            layerSetState(.u64, &inc, i, @enumFromInt(@intFromEnum(patternState(pat, i))));
+            layerSetState(.u64, &exc, i, @enumFromInt(@intFromEnum(patternState(pat, i))));
+        }
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
+        switch (pat) {
+            .all_inactive, .all_active => try t.expectEqual(@as(usize, 0), ctx.total()),
+            .all_mixed => {
+                try t.expectEqual(@as(usize, 70), ctx.nm);
+                try t.expectEqual(@as(usize, 0), ctx.ni + ctx.na + ctx.nd);
+            },
+            .all_deep => {
+                try t.expectEqual(@as(usize, 70), ctx.nd);
+                try t.expectEqual(@as(usize, 0), ctx.ni + ctx.na + ctx.nm);
+            },
+            else => unreachable,
+        }
+    }
+    {
+        var inc: Layer(.u64) = .{};
+        var exc: Layer(.u64) = .{};
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        try inc.resize(t.allocator, 70, .active);
+        try exc.resize(t.allocator, 70, .inactive);
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
+        try t.expectEqual(@as(usize, 70), ctx.na);
+        try t.expectEqual(@as(usize, 0), ctx.ni + ctx.nm + ctx.nd);
+    }
+    {
+        var inc: Layer(.u64) = .{};
+        var exc: Layer(.u64) = .{};
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        try inc.resize(t.allocator, 70, .inactive);
+        try exc.resize(t.allocator, 70, .active);
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
+        try t.expectEqual(@as(usize, 70), ctx.ni);
+        try t.expectEqual(@as(usize, 0), ctx.na + ctx.nm + ctx.nd);
+    }
+}
+
+test "Layer CommonIterator: oracle corners 2+2" {
+    const sizes_u64 = [_]u32{ 0, 1, 2, 7, 8, 9, 63, 64, 65, 70, 129, 200 };
+    const sizes_u8 = [_]u32{ 0, 1, 7, 8, 9, 16, 17, 24 };
+    const pats = [_]StepPattern{ .all_inactive, .all_active, .cycle4, .pseudo };
+    for (sizes_u64) |n| {
+        for (pats) |p0| {
+            for (pats) |p1| {
+                for (pats) |p2| {
+                    for (pats) |p3| {
+                        try commonCheckOne(.u64, 2, 2, n, .{ p0, p1 }, .{ p2, p3 });
+                    }
+                }
+            }
+        }
+    }
+    for (sizes_u8) |n| {
+        for (pats) |p0| {
+            for (pats) |p1| {
+                for (pats) |p2| {
+                    for (pats) |p3| {
+                        try commonCheckOne(.u8, 2, 2, n, .{ p0, p1 }, .{ p2, p3 });
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "Layer CommonIterator: oracle corners 1+1 exhaustive patterns" {
+    const sizes = [_]u32{ 0, 1, 2, 7, 8, 9, 16, 17, 63, 64, 65, 70, 129 };
+    const patterns = [_]StepPattern{ .all_inactive, .all_active, .all_mixed, .all_deep, .cycle4, .sparse_deep, .pseudo };
+    for (sizes) |n| {
+        for (patterns) |pi| {
+            for (patterns) |pe| {
+                try commonCheckOne(.u64, 1, 1, n, .{pi}, .{pe});
+                try commonCheckOne(.u8, 1, 1, n, .{pi}, .{pe});
+            }
+        }
+    }
+}
+
+test "Layer CommonIterator: oracle corners mixed lens" {
+    const sizes = [_]u32{ 0, 1, 8, 9, 17, 64, 65, 70, 130 };
+    const pats = [_]StepPattern{ .all_inactive, .all_active, .cycle4, .pseudo };
+    for (sizes) |n| {
+        for (pats) |p0| {
+            for (pats) |p1| {
+                try commonCheckOne(.u64, 2, 1, n, .{ p0, p1 }, .{p0});
+                try commonCheckOne(.u64, 1, 2, n, .{p0}, .{ p0, p1 });
+                try commonCheckOne(.u64, 3, 1, n, .{ p0, p1, p0 }, .{p1});
+                try commonCheckOne(.u64, 1, 3, n, .{p0}, .{ p0, p1, p0 });
+                try commonCheckOne(.u64, 3, 3, n, .{ p0, p1, p0 }, .{ p1, p0, p1 });
+                try commonCheckOne(.u8, 2, 0, n, .{ p0, p1 }, .{});
+                try commonCheckOne(.u8, 0, 2, n, .{}, .{ p0, p1 });
+                try commonCheckOne(.u8, 3, 0, n, .{ p0, p1, p0 }, .{});
+                try commonCheckOne(.u8, 0, 3, n, .{}, .{ p0, p1, p0 });
+            }
+        }
+    }
+}
+
+test "Layer CommonIterator: oracle word types u16/u32" {
+    const sizes16 = [_]u32{ 0, 1, 15, 16, 17, 33 };
+    const sizes32 = [_]u32{ 0, 1, 31, 32, 33, 65 };
+    const pats = [_]StepPattern{ .all_inactive, .all_active, .cycle4, .pseudo };
+    for (sizes16) |n| {
+        for (pats) |p0| {
+            for (pats) |p1| {
+                try commonCheckOne(.u16, 2, 2, n, .{ p0, p1 }, .{ p1, p0 });
+                try commonCheckOne(.u16, 1, 1, n, .{p0}, .{p1});
+            }
+        }
+    }
+    for (sizes32) |n| {
+        for (pats) |p0| {
+            for (pats) |p1| {
+                try commonCheckOne(.u32, 2, 2, n, .{ p0, p1 }, .{ p1, p0 });
+                try commonCheckOne(.u32, 1, 1, n, .{p0}, .{p1});
+            }
+        }
+    }
+}
+
+test "Layer CommonIterator: boundary oracle u64" {
+    const bounds = [_]u32{ 0, 1, 2, 63, 64, 65, 70, 100, 126, 127, 128, 129, 130, 191, 192, 193, 200 };
+    const pats = [_]StepPattern{ .all_inactive, .all_active, .all_mixed, .all_deep, .cycle4, .sparse_deep, .pseudo };
+    for (bounds) |n| {
+        for (pats) |pi| {
+            try commonCheckOne(.u64, 2, 2, n, .{ pi, .pseudo }, .{ .cycle4, pi });
+            try commonCheckOne(.u64, 1, 1, n, .{pi}, .{.pseudo});
+        }
+    }
+}
+
+fn commonRandU32(state: *u64) u32 {
+    var x = state.*;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    state.* = x;
+    return @truncate((x *% 0x2545F4914F6CDD1D) >> 32);
+}
+
+test "Layer CommonIterator: fuzz vs oracle u64 2+2" {
+    var rng: u64 = 0x9E3779B97F4A7C15;
+    var step: usize = 0;
+    while (step < 300) : (step += 1) {
+        const n: u32 = commonRandU32(&rng) % 201;
+        errdefer std.debug.print("COMMON LAYER FUZZ u64 2+2 fail step={} n={}\n", .{ step, n });
+        var inc_sets: [2]Layer(.u64) = .{ .{}, .{} };
+        var exc_sets: [2]Layer(.u64) = .{ .{}, .{} };
+        defer {
+            for (0..2) |k| inc_sets[k].deinit(t.allocator);
+            for (0..2) |k| exc_sets[k].deinit(t.allocator);
+        }
+        for (0..2) |k| try inc_sets[k].resize(t.allocator, n, .inactive);
+        for (0..2) |k| try exc_sets[k].resize(t.allocator, n, .inactive);
+        for (0..2) |k| {
+            var w: usize = 0;
+            while (w < inc_sets[k].activity.items.len) : (w += 1) {
+                inc_sets[k].activity.items[w] = commonRandU32(&rng);
+                inc_sets[k].activity.items[w] |= @as(u64, commonRandU32(&rng)) << 32;
+                inc_sets[k].mixed.items[w] = commonRandU32(&rng);
+                inc_sets[k].mixed.items[w] |= @as(u64, commonRandU32(&rng)) << 32;
+            }
+        }
+        for (0..2) |k| {
+            var w: usize = 0;
+            while (w < exc_sets[k].activity.items.len) : (w += 1) {
+                exc_sets[k].activity.items[w] = commonRandU32(&rng);
+                exc_sets[k].activity.items[w] |= @as(u64, commonRandU32(&rng)) << 32;
+                exc_sets[k].mixed.items[w] = commonRandU32(&rng);
+                exc_sets[k].mixed.items[w] |= @as(u64, commonRandU32(&rng)) << 32;
+            }
+        }
+        if (n > 0) {
+            const BW = bit_word.BitWord(.u64);
+            const used = BW.bitIdInWord(n);
+            if (used != 0) {
+                const valid = BW.maskStart(used);
+                for (0..2) |k| {
+                    inc_sets[k].activity.items[inc_sets[k].activity.items.len - 1] &= valid;
+                    inc_sets[k].mixed.items[inc_sets[k].mixed.items.len - 1] &= valid;
+                    exc_sets[k].activity.items[exc_sets[k].activity.items.len - 1] &= valid;
+                    exc_sets[k].mixed.items[exc_sets[k].mixed.items.len - 1] &= valid;
+                }
+            }
+        }
+        if ((step & 1) == 0) {
+            commonPoisonPadding(.u64, 2, 2, .{ &inc_sets[0], &inc_sets[1] }, .{ &exc_sets[0], &exc_sets[1] }, n);
+        }
+        var exp: [4][256]u32 = undefined;
+        const ns = commonOracleStates(.u64, 2, 2, .{ &inc_sets[0], &inc_sets[1] }, .{ &exc_sets[0], &exc_sets[1] }, n, &exp);
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(.u64, 2, 2, stepPushI, stepPushA, stepPushM, stepPushD, .{ &inc_sets[0], &inc_sets[1] }, .{ &exc_sets[0], &exc_sets[1] }, &ctx));
+        try t.expectEqualSlices(u32, exp[0][0..ns[0]], ctx.inactive[0..ctx.ni]);
+        try t.expectEqualSlices(u32, exp[1][0..ns[1]], ctx.active[0..ctx.na]);
+        try t.expectEqualSlices(u32, exp[2][0..ns[2]], ctx.mixed[0..ctx.nm]);
+        try t.expectEqualSlices(u32, exp[3][0..ns[3]], ctx.deep[0..ctx.nd]);
+    }
+}
+
+test "Layer CommonIterator: fuzz vs oracle u8 3+3" {
+    var rng: u64 = 0x123456789ABCDEF;
+    var step: usize = 0;
+    while (step < 200) : (step += 1) {
+        const n: u32 = commonRandU32(&rng) % 41;
+        errdefer std.debug.print("COMMON LAYER FUZZ u8 3+3 fail step={} n={}\n", .{ step, n });
+        var inc_sets: [3]Layer(.u8) = .{ .{}, .{}, .{} };
+        var exc_sets: [3]Layer(.u8) = .{ .{}, .{}, .{} };
+        defer {
+            for (0..3) |k| inc_sets[k].deinit(t.allocator);
+            for (0..3) |k| exc_sets[k].deinit(t.allocator);
+        }
+        for (0..3) |k| try inc_sets[k].resize(t.allocator, n, .inactive);
+        for (0..3) |k| try exc_sets[k].resize(t.allocator, n, .inactive);
+        for (0..3) |k| {
+            var w: usize = 0;
+            while (w < inc_sets[k].activity.items.len) : (w += 1) {
+                inc_sets[k].activity.items[w] = @truncate(commonRandU32(&rng));
+                inc_sets[k].mixed.items[w] = @truncate(commonRandU32(&rng));
+            }
+        }
+        for (0..3) |k| {
+            var w: usize = 0;
+            while (w < exc_sets[k].activity.items.len) : (w += 1) {
+                exc_sets[k].activity.items[w] = @truncate(commonRandU32(&rng));
+                exc_sets[k].mixed.items[w] = @truncate(commonRandU32(&rng));
+            }
+        }
+        if (n > 0) {
+            const BW = bit_word.BitWord(.u8);
+            const used = BW.bitIdInWord(n);
+            if (used != 0) {
+                const valid = BW.maskStart(used);
+                for (0..3) |k| {
+                    inc_sets[k].activity.items[inc_sets[k].activity.items.len - 1] &= valid;
+                    inc_sets[k].mixed.items[inc_sets[k].mixed.items.len - 1] &= valid;
+                    exc_sets[k].activity.items[exc_sets[k].activity.items.len - 1] &= valid;
+                    exc_sets[k].mixed.items[exc_sets[k].mixed.items.len - 1] &= valid;
+                }
+            }
+        }
+        if ((step & 1) == 0) {
+            commonPoisonPadding(.u8, 3, 3, .{ &inc_sets[0], &inc_sets[1], &inc_sets[2] }, .{ &exc_sets[0], &exc_sets[1], &exc_sets[2] }, n);
+        }
+        var exp: [4][256]u32 = undefined;
+        const ns = commonOracleStates(.u8, 3, 3, .{ &inc_sets[0], &inc_sets[1], &inc_sets[2] }, .{ &exc_sets[0], &exc_sets[1], &exc_sets[2] }, n, &exp);
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(.u8, 3, 3, stepPushI, stepPushA, stepPushM, stepPushD, .{ &inc_sets[0], &inc_sets[1], &inc_sets[2] }, .{ &exc_sets[0], &exc_sets[1], &exc_sets[2] }, &ctx));
+        try t.expectEqualSlices(u32, exp[0][0..ns[0]], ctx.inactive[0..ctx.ni]);
+        try t.expectEqualSlices(u32, exp[1][0..ns[1]], ctx.active[0..ctx.na]);
+        try t.expectEqualSlices(u32, exp[2][0..ns[2]], ctx.mixed[0..ctx.nm]);
+        try t.expectEqualSlices(u32, exp[3][0..ns[3]], ctx.deep[0..ctx.nd]);
+    }
+}
+
+test "Layer CommonIterator: null side is skipped" {
+    {
+        var inc: Layer(.u64) = .{};
+        var exc: Layer(.u64) = .{};
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        try inc.resize(t.allocator, 70, .inactive);
+        try exc.resize(t.allocator, 70, .inactive);
+        layerSetState(.u64, &inc, 5, .active);
+        layerSetState(.u64, &inc, 69, .active);
+        layerSetState(.u64, &exc, 69, .active);
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(.u64, 1, 1, null, stepPushA, null, null, .{&inc}, .{&exc}, &ctx));
+        try t.expectEqualSlices(u32, &[_]u32{5}, ctx.active[0..ctx.na]);
+        try t.expectEqual(@as(usize, 0), ctx.ni + ctx.nm + ctx.nd);
+    }
+    {
+        var inc: Layer(.u8) = .{};
+        var exc: Layer(.u8) = .{};
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        try inc.resize(t.allocator, 10, .inactive);
+        try exc.resize(t.allocator, 10, .inactive);
+        layerSetState(.u8, &exc, 3, .active);
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(.u8, 1, 1, stepPushI, null, null, null, .{&inc}, .{&exc}, &ctx));
+        try t.expectEqualSlices(u32, &[_]u32{3}, ctx.inactive[0..ctx.ni]);
+        try t.expectEqual(@as(usize, 0), ctx.na + ctx.nm + ctx.nd);
+    }
+    {
+        var inc: Layer(.u64) = .{};
+        var exc: Layer(.u64) = .{};
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        try inc.resize(t.allocator, 10, .mixed);
+        try exc.resize(t.allocator, 10, .mixed);
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(.u64, 1, 1, null, null, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
+        try t.expectEqual(@as(usize, 0), ctx.ni + ctx.na);
+        try t.expectEqual(@as(usize, 10), ctx.nm);
+        try t.expectEqual(@as(usize, 0), ctx.nd);
+    }
+}
+
+test "Layer CommonIterator: early exit stops the walk" {
+    {
+        var inc: Layer(.u64) = .{};
+        var exc: Layer(.u64) = .{};
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        try inc.resize(t.allocator, 70, .inactive);
+        try exc.resize(t.allocator, 70, .active);
+        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        var ctx = StepStates{ .stop_after = 3 };
+        try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
+        try t.expectEqual(@as(usize, 3), ctx.ni);
+        try t.expectEqual(@as(usize, 0), ctx.na + ctx.nm + ctx.nd);
+        try t.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, ctx.inactive[0..ctx.ni]);
+    }
+    {
+        var inc: Layer(.u64) = .{};
+        var exc: Layer(.u64) = .{};
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        try inc.resize(t.allocator, 10, .inactive);
+        try exc.resize(t.allocator, 10, .active);
+        layerSetState(.u64, &inc, 0, .active);
+        layerSetState(.u64, &inc, 9, .active);
+        layerSetState(.u64, &exc, 0, .inactive);
+        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        var ctx = StepStates{ .stop_after = 4 };
+        try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
+        try t.expectEqualSlices(u32, &[_]u32{0}, ctx.active[0..ctx.na]);
+        try t.expectEqualSlices(u32, &[_]u32{ 1, 2, 3 }, ctx.inactive[0..ctx.ni]);
+    }
+    {
+        var inc: Layer(.u64) = .{};
+        var exc: Layer(.u64) = .{};
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        try inc.resize(t.allocator, 130, .deep_mixed);
+        try exc.resize(t.allocator, 130, .deep_mixed);
+        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        var ctx = StepStates{ .stop_after = 70 };
+        try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
+        try t.expectEqual(@as(usize, 64), ctx.nd);
+        try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 1));
+        try t.expectEqual(@as(usize, 70), ctx.nd);
+        try t.expectEqual(@as(u32, 64), ctx.deep[64]);
+        try t.expectEqual(@as(u32, 69), ctx.deep[69]);
+    }
+    {
+        var inc: Layer(.u64) = .{};
+        var exc: Layer(.u64) = .{};
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        try inc.resize(t.allocator, 10, .mixed);
+        try exc.resize(t.allocator, 10, .deep_mixed);
+        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        var ctx = StepStates{ .stop_after = 1 };
+        try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
+        try t.expectEqual(@as(usize, 1), ctx.total());
+        try t.expectEqual(@as(u32, 0), ctx.mixed[0]);
+    }
+    {
+        var inc: Layer(.u64) = .{};
+        var exc: Layer(.u64) = .{};
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        try inc.resize(t.allocator, 10, .active);
+        try exc.resize(t.allocator, 10, .inactive);
+        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        var ctx = StepStates{ .stop_after = 50 };
+        try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
+        try t.expectEqual(@as(usize, 10), ctx.na);
+        var only_d = StepStates{ .stop_after = 1 };
+        const ItD = Layer(.u64).CommonIterator(1, 1, *StepStates, null, null, null, stepPushD);
+        try t.expect(ItD.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &only_d }, 0));
+        try t.expectEqual(@as(usize, 0), only_d.total());
+    }
+}
+
+test "Layer CommonIterator: empty sets and zero lens" {
+    {
+        var inc0: Layer(.u64) = .{};
+        var inc1: Layer(.u64) = .{};
+        var exc0: Layer(.u64) = .{};
+        var exc1: Layer(.u64) = .{};
+        defer inc0.deinit(t.allocator);
+        defer inc1.deinit(t.allocator);
+        defer exc0.deinit(t.allocator);
+        defer exc1.deinit(t.allocator);
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(.u64, 2, 2, stepPushI, stepPushA, stepPushM, stepPushD, .{ &inc0, &inc1 }, .{ &exc0, &exc1 }, &ctx));
+        try t.expectEqual(@as(usize, 0), ctx.total());
+    }
+    {
+        const It00 = Layer(.u64).CommonIterator(0, 0, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        var ctx = StepStates{};
+        try t.expect(It00.step(.{ .includes = .{}, .excludes = .{}, .context = &ctx }, 0));
+        try t.expectEqual(@as(usize, 0), ctx.total());
+    }
+    {
+        var exc: Layer(.u8) = .{};
+        defer exc.deinit(t.allocator);
+        try exc.resize(t.allocator, 10, .inactive);
+        layerSetState(.u8, &exc, 5, .active);
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(.u8, 0, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{}, .{&exc}, &ctx));
+        try t.expectEqual(@as(usize, 9), ctx.na);
+        try t.expectEqualSlices(u32, &[_]u32{5}, ctx.inactive[0..ctx.ni]);
+        for (ctx.active[0..ctx.na]) |id| try t.expect(id != 5);
+    }
+    {
+        var inc: Layer(.u8) = .{};
+        defer inc.deinit(t.allocator);
+        try inc.resize(t.allocator, 10, .inactive);
+        layerSetState(.u8, &inc, 3, .active);
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(.u8, 1, 0, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{}, &ctx));
+        try t.expectEqualSlices(u32, &[_]u32{3}, ctx.active[0..ctx.na]);
+        try t.expectEqual(@as(usize, 9), ctx.ni);
+        for (ctx.inactive[0..ctx.ni]) |id| try t.expect(id != 3);
+    }
+}
+
+test "Layer CommonIterator: tail bound never leaks padding" {
+    const tails = [_]u32{ 1, 2, 63, 65, 70, 127, 129, 130, 193, 200 };
+    for (tails) |n| {
+        var inc: Layer(.u64) = .{};
+        var exc: Layer(.u64) = .{};
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        try inc.resize(t.allocator, n, .active);
+        try exc.resize(t.allocator, n, .inactive);
+        const BW = bit_word.BitWord(.u64);
+        const valid = BW.maskStart(BW.bitIdInWord(n));
+        inc.activity.items[inc.activity.items.len - 1] |= ~valid;
+        inc.mixed.items[inc.mixed.items.len - 1] |= ~valid;
+        exc.activity.items[exc.activity.items.len - 1] |= ~valid;
+        exc.mixed.items[exc.mixed.items.len - 1] |= ~valid;
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
+        try t.expectEqual(n, @as(u32, @intCast(ctx.na)));
+        try t.expectEqual(@as(usize, 0), ctx.ni + ctx.nm + ctx.nd);
+        try t.expectEqual(@as(u32, n - 1), ctx.active[ctx.na - 1]);
+    }
+    {
+        var inc: Layer(.u64) = .{};
+        var exc: Layer(.u64) = .{};
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        try inc.resize(t.allocator, 65, .inactive);
+        try exc.resize(t.allocator, 65, .active);
+        const BW = bit_word.BitWord(.u64);
+        const valid = BW.maskStart(BW.bitIdInWord(65));
+        inc.activity.items[inc.activity.items.len - 1] |= ~valid;
+        inc.mixed.items[inc.mixed.items.len - 1] |= ~valid;
+        exc.activity.items[exc.activity.items.len - 1] |= ~valid;
+        exc.mixed.items[exc.mixed.items.len - 1] |= ~valid;
+        var ctx = StepStates{};
+        try t.expect(commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
+        try t.expectEqual(@as(usize, 0), ctx.na + ctx.nm + ctx.nd);
+        try t.expectEqual(@as(u32, 65), @as(u32, @intCast(ctx.ni)));
+        try t.expectEqual(@as(u32, 64), ctx.inactive[ctx.ni - 1]);
+    }
+}
+
+test "Layer CommonIterator: global order is ascending" {
+    const sizes = [_]u32{ 1, 8, 9, 17, 64, 65, 70, 130 };
+    const pats = [_]StepPattern{ .cycle4, .sparse_deep, .pseudo, .all_mixed };
+    for (sizes) |n| {
+        for (pats) |p0| {
+            for (pats) |p1| {
+                try commonCheckOrder(.u64, 2, 2, n, .{ p0, p1 }, .{ p1, p0 });
+                try commonCheckOrder(.u8, 1, 1, n % 25, .{p0}, .{p1});
+            }
+        }
+    }
+    try commonCheckOrder(.u64, 1, 0, 70, .{.pseudo}, .{});
+    try commonCheckOrder(.u64, 0, 1, 70, .{}, .{.pseudo});
+    try commonCheckOrder(.u64, 3, 3, 130, .{ .cycle4, .sparse_deep, .pseudo }, .{ .pseudo, .all_deep, .all_inactive });
 }

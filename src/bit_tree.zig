@@ -1124,3 +1124,138 @@ test "BitTree hoisted arms parity vs oracle" {
         }
     }
 }
+
+const CrossIds = struct {
+    alloc: Allocator,
+    sums: [4]*Layer(.u64),
+    active: std.ArrayList(u32) = .empty,
+    inactive: std.ArrayList(u32) = .empty,
+};
+
+inline fn crossNT(ctx: *CrossIds, pos: u32) bool {
+    const BW = bit_word.BitWord(.u64);
+    const wid: usize = @intCast(BW.bitToWordId(pos));
+    const in_w = BW.bitIdInWord(pos);
+    for (ctx.sums) |layer| {
+        if (BW.readBitState(layer.mixed.items[wid], in_w) == .active) return true;
+    }
+    return false;
+}
+
+inline fn crossPushA(ctx: *CrossIds, bit_id: u32) bool {
+    if (crossNT(ctx, bit_id >> 6)) return true;
+    ctx.active.append(ctx.alloc, bit_id) catch unreachable;
+    return true;
+}
+
+inline fn crossPushI(ctx: *CrossIds, bit_id: u32) bool {
+    if (crossNT(ctx, bit_id >> 6)) return true;
+    ctx.inactive.append(ctx.alloc, bit_id) catch unreachable;
+    return true;
+}
+
+const CrossLock = struct {
+    active: []const u32,
+    inactive: []const u32,
+    ca: usize = 0,
+    ci: usize = 0,
+};
+
+inline fn crossLockPushI(ctx: *CrossLock, pos: u32) bool {
+    std.debug.assert(ctx.ci + 64 <= ctx.inactive.len);
+    std.debug.assert(ctx.inactive[ctx.ci] == pos * 64);
+    ctx.ci += 64;
+    return true;
+}
+
+inline fn crossLockPushA(ctx: *CrossLock, pos: u32) bool {
+    std.debug.assert(ctx.ca + 64 <= ctx.active.len);
+    std.debug.assert(ctx.active[ctx.ca] == pos * 64);
+    ctx.ca += 64;
+    return true;
+}
+
+fn crossLockPushM(ctx: *CrossLock, pos: u32) bool {
+    _ = ctx;
+    _ = pos;
+    return true;
+}
+
+inline fn crossLockPushD(ctx: *CrossLock, pos: u32) bool {
+    _ = ctx;
+    _ = pos;
+    return true;
+}
+
+fn crossRandU32(state: *u64) u32 {
+    var x = state.*;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    state.* = x;
+    return @truncate((x *% 0x2545F4914F6CDD1D) >> 32);
+}
+
+test "BitTree CommonIterator cross: summary layer vs bitset 262144" {
+    const N: u32 = 262144;
+    const WORDS: u32 = N / 64;
+    var rng: u64 = 0x9E3779B97F4A7C15;
+    var trees: [4]BitTree(.u64) = .{ .{}, .{}, .{}, .{} };
+    defer {
+        for (0..4) |k| trees[k].deinit(t.allocator);
+    }
+    for (0..4) |k| try trees[k].resize(t.allocator, N, .inactive);
+    var w: u32 = 0;
+    while (w < WORDS) : (w += 1) {
+        for (0..4) |k| {
+            const hi = crossRandU32(&rng);
+            const lo = crossRandU32(&rng);
+            const pick = crossRandU32(&rng);
+            const word: u64 = if ((w & 1) == 0)
+                (@as(u64, hi) << 32) | lo
+            else if ((pick & 1) == 1)
+                0
+            else
+                std.math.maxInt(u64);
+            trees[k].setWord(w, word, std.math.maxInt(u64));
+        }
+    }
+
+    const sum0 = &trees[0].layers.items[1];
+    const sum1 = &trees[1].layers.items[1];
+    const sum2 = &trees[2].layers.items[1];
+    const sum3 = &trees[3].layers.items[1];
+    try t.expectEqual(N / 64, sum0.bits_count);
+    try t.expectEqual(@as(usize, WORDS / 64), sum0.activity.items.len);
+
+    // Phase 1: walk the bitsets, skipping bits whose word is mixed or
+    // deeply mixed in any summary layer.
+    var bctx = CrossIds{ .alloc = t.allocator, .sums = .{ sum0, sum1, sum2, sum3 } };
+    defer bctx.active.deinit(bctx.alloc);
+    defer bctx.inactive.deinit(bctx.alloc);
+    try bctx.active.ensureTotalCapacity(bctx.alloc, N);
+    try bctx.inactive.ensureTotalCapacity(bctx.alloc, N);
+    const BI = BitSet(.u64).CommonIterator(2, 2, *CrossIds, crossPushA, crossPushI);
+    try t.expect(BI.iterateAll(.{
+        .includes = .{ &trees[0].bitset, &trees[1].bitset },
+        .excludes = .{ &trees[2].bitset, &trees[3].bitset },
+        .context = &bctx,
+    }));
+
+    // Phase 2: walk the layers lockstep with the phase 1 lists. Every
+    // visited active/inactive position must open a full 64-bit run.
+    var lock = CrossLock{ .active = bctx.active.items, .inactive = bctx.inactive.items };
+    const LI = Layer(.u64).CommonIterator(2, 2, *CrossLock, crossLockPushI, crossLockPushA, crossLockPushM, crossLockPushD);
+    const ldata: Layer(.u64).LayersWithContext(2, 2, *CrossLock) = .{
+        .includes = .{ sum0, sum1 },
+        .excludes = .{ sum2, sum3 },
+        .context = &lock,
+    };
+    var wid: u32 = 0;
+    while (wid < sum0.activity.items.len) : (wid += 1) {
+        try t.expect(LI.step(ldata, wid));
+    }
+    try t.expectEqual(bctx.active.items.len, lock.ca);
+    try t.expectEqual(bctx.inactive.items.len, lock.ci);
+    std.debug.print("cross 262144: active={} inactive={}\n", .{ bctx.active.items.len, bctx.inactive.items.len });
+}
