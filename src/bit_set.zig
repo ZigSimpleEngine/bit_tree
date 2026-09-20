@@ -10,6 +10,10 @@ const BitRange = utilities.BitRange;
 const BitState = utilities.BitState;
 const WordType = bit_word.WordType;
 
+/// Flat bitset with word storage and exact active-bit counts.
+/// - `wt` - word width for backing storage.
+///
+/// Return - bitset type with word-wise iteration.
 pub fn BitSet(comptime wt: WordType) type {
     const Word = wt.Type();
     const bw = bit_word.BitWord(wt);
@@ -17,37 +21,105 @@ pub fn BitSet(comptime wt: WordType) type {
     return struct {
         const Self = @This();
 
+        /// Backing words, padding bits always zeroed.
         words: ListA64(Word) = .empty,
+        /// Valid bits in the set, excludes padding.
         bits_count: u32 = 0,
+        /// Cached active total, updated on every mutation.
         active_bits_counter: u32 = 0,
 
+        /// Bundles a bitset pointer with caller context for iteration.
+        /// - `Context` - caller-provided iteration context.
+        ///
+        /// Return - pairing struct passed to every step call.
         pub fn BitsetWithContext(Context: type) type {
             return struct {
+                /// Bitset being scanned, provides words and bounds.
                 bitset: *Self,
+                /// Caller context forwarded to per-bit callbacks.
                 context: Context,
             };
         }
 
+        /// Builds a word-wise visitor that dispatches by bit value.
         pub fn Iterator(
             comptime Context: type,
             comptime on_active: InlineIteratorCallback(Context),
             comptime on_inactive: InlineIteratorCallback(Context),
         ) type {
             return struct {
+                /// Visits one word and routes each valid bit to its callback.
+                /// - `data` - bitset and caller context.
+                /// - `word_id` - word index to scan.
+                ///
+                /// Return - false on early exit, true when the word completed.
                 pub inline fn step(data: BitsetWithContext(Context), word_id: u32) bool {
-                    // Both callbacks present go bitwise linear; any missing
-                    // callback goes through the pending union. Comptime-known:
-                    // dead arm is eliminated, no runtime cost.
                     if (on_active != null and on_inactive != null) {
                         return stepFull(data, word_id);
                     } else {
                         return stepPending(data, word_id);
                     }
                 }
+                /// Scans all words with split main and tail loops for speed.
+                /// - `data` - bitset and caller context.
+                ///
+                /// Return - false on early exit, true when the scan completed.
+                pub inline fn iterateAll(data: BitsetWithContext(Context)) bool {
+                    const bitset = data.bitset;
+                    const context = data.context;
+                    const words = bitset.words.items;
+                    const total = bitset.bits_count;
+                    if (words.len == 0) return true;
 
-                /// Both callbacks present: every valid bit dispatches to
-                /// exactly one side, so reuses the linear merge (bound instead
-                /// of mask, last arm unchecked) via flatMergeWord.
+                    if (on_active) |f| {
+                        if (on_inactive == null) {
+                            var wid: usize = 0;
+                            while (wid + 1 < words.len) : (wid += 1) {
+                                const base: u32 = @truncate(wid * bw.word_type_bits);
+                                if (!flatPeelWord(context, base, words[wid], f)) return false;
+                            }
+                            const last = words.len - 1;
+                            const base: u32 = @truncate(last * bw.word_type_bits);
+                            var w = words[last];
+                            const used = bw.bitIdInWord(total);
+                            if (used != 0) w &= bw.maskStart(used);
+                            return flatPeelWord(context, base, w, f);
+                        }
+                    }
+
+                    if (on_inactive) |f| {
+                        if (on_active == null) {
+                            var wid: usize = 0;
+                            while (wid + 1 < words.len) : (wid += 1) {
+                                const base: u32 = @truncate(wid * bw.word_type_bits);
+                                if (!flatPeelWord(context, base, ~words[wid], f)) return false;
+                            }
+                            const last = words.len - 1;
+                            const base: u32 = @truncate(last * bw.word_type_bits);
+                            var w = ~words[last];
+                            const used = bw.bitIdInWord(total);
+                            if (used != 0) w &= bw.maskStart(used);
+                            return flatPeelWord(context, base, w, f);
+                        }
+                    }
+
+                    var wid: usize = 0;
+                    while (wid + 1 < words.len) : (wid += 1) {
+                        const base: u32 = @truncate(wid * bw.word_type_bits);
+                        if (!flatMergeWord(context, base, words[wid], bw.word_type_bits)) return false;
+                    }
+                    const last = words.len - 1;
+                    const base: u32 = @truncate(last * bw.word_type_bits);
+                    const used = bw.bitIdInWord(total);
+                    const bound: u32 = if (used != 0) used else bw.word_type_bits;
+                    return flatMergeWord(context, base, words[last], bound);
+                }
+
+                /// Fast path when both callbacks exist, merges by bound linearly.
+                /// - `data` - bitset and caller context.
+                /// - `word_id` - word index to scan.
+                ///
+                /// Return - false on early exit, true when the word completed.
                 inline fn stepFull(data: BitsetWithContext(Context), word_id: u32) bool {
                     const bitset = data.bitset;
                     const context = data.context;
@@ -63,6 +135,11 @@ pub fn BitSet(comptime wt: WordType) type {
                     return flatMergeWord(context, start, word, bound);
                 }
 
+                /// Selective path that peels only sides with installed callbacks.
+                /// - `data` - bitset and caller context.
+                /// - `word_id` - word index to scan.
+                ///
+                /// Return - false on early exit, true when the word completed.
                 inline fn stepPending(data: BitsetWithContext(Context), word_id: u32) bool {
                     const bitset = data.bitset;
                     const context = data.context;
@@ -78,8 +155,6 @@ pub fn BitSet(comptime wt: WordType) type {
                         if (used != 0) mask = bw.maskStart(used);
                     }
 
-                    // Single-sided fast paths: pure ctz-peeling of the wanted
-                    // side only (p9-style, no merge mask, no per-bit dispatch).
                     if (on_active) |f| {
                         if (on_inactive == null) {
                             var only_active_word = word & mask;
@@ -135,8 +210,13 @@ pub fn BitSet(comptime wt: WordType) type {
                     return true;
                 }
 
-                /// Peel one ready-masked word into a single callback, in
-                /// ascending bit order, honoring early exit.
+                /// Peels one masked word into a single callback in bit order.
+                /// - `context` - caller context for the callback.
+                /// - `base` - global id of the word start.
+                /// - `word` - pre-masked word to peel.
+                /// - `f` - inline visitor, false stops the walk.
+                ///
+                /// Return - false on early exit, true when the word completed.
                 inline fn flatPeelWord(
                     context: Context,
                     base: u32,
@@ -152,12 +232,13 @@ pub fn BitSet(comptime wt: WordType) type {
                     return true;
                 }
 
-                /// Ordered merge over a plain word with a valid-bit bound (no
-                /// mask needed): every position dispatches to exactly one
-                /// side, so ctz-peeling a union is pointless — a linear scan
-                /// with one bit test does the same work cheaper. The last arm
-                /// is a bare else: with both callbacks present a bit that
-                /// missed active is definitely inactive.
+                /// Merges one bounded word into active and inactive callbacks linearly.
+                /// - `context` - caller context for the callbacks.
+                /// - `base` - global id of the word start.
+                /// - `word` - raw word to classify bit by bit.
+                /// - `valid_len` - valid bits in the word, bounds the scan.
+                ///
+                /// Return - false on early exit, true when the word completed.
                 inline fn flatMergeWord(
                     context: Context,
                     base: u32,
@@ -178,67 +259,21 @@ pub fn BitSet(comptime wt: WordType) type {
                     }
                     return true;
                 }
-
-                pub inline fn iterateAll(data: BitsetWithContext(Context)) bool {
-                    // Main loop runs over [0, len-1): no last-word check, no
-                    // mask AND inside. The tail handles the last word once.
-                    // Bodies live in flatPeelWord/flatMergeWord below.
-                    const bitset = data.bitset;
-                    const context = data.context;
-                    const words = bitset.words.items;
-                    const total = bitset.bits_count;
-                    if (words.len == 0) return true;
-
-                    if (on_active) |f| {
-                        if (on_inactive == null) {
-                            var wid: usize = 0;
-                            while (wid + 1 < words.len) : (wid += 1) {
-                                const base: u32 = @truncate(wid * bw.word_type_bits);
-                                if (!flatPeelWord(context, base, words[wid], f)) return false;
-                            }
-                            const last = words.len - 1;
-                            const base: u32 = @truncate(last * bw.word_type_bits);
-                            var w = words[last];
-                            const used = bw.bitIdInWord(total);
-                            if (used != 0) w &= bw.maskStart(used);
-                            return flatPeelWord(context, base, w, f);
-                        }
-                    }
-
-                    if (on_inactive) |f| {
-                        if (on_active == null) {
-                            var wid: usize = 0;
-                            while (wid + 1 < words.len) : (wid += 1) {
-                                const base: u32 = @truncate(wid * bw.word_type_bits);
-                                if (!flatPeelWord(context, base, ~words[wid], f)) return false;
-                            }
-                            const last = words.len - 1;
-                            const base: u32 = @truncate(last * bw.word_type_bits);
-                            var w = ~words[last];
-                            const used = bw.bitIdInWord(total);
-                            if (used != 0) w &= bw.maskStart(used);
-                            return flatPeelWord(context, base, w, f);
-                        }
-                    }
-
-                    var wid: usize = 0;
-                    while (wid + 1 < words.len) : (wid += 1) {
-                        const base: u32 = @truncate(wid * bw.word_type_bits);
-                        if (!flatMergeWord(context, base, words[wid], bw.word_type_bits)) return false;
-                    }
-                    const last = words.len - 1;
-                    const base: u32 = @truncate(last * bw.word_type_bits);
-                    const used = bw.bitIdInWord(total);
-                    const bound: u32 = if (used != 0) used else bw.word_type_bits;
-                    return flatMergeWord(context, base, words[last], bound);
-                }
             };
         }
 
+        /// Releases backing word storage.
+        /// - `self` - bitset to destroy.
+        /// - `allocator` - allocator that owns the words.
         pub fn deinit(self: *Self, allocator: Allocator) void {
             self.words.deinit(allocator);
         }
 
+        /// Writes masked lanes of one word and refreshes the active count.
+        /// - `self` - bitset to update.
+        /// - `id` - word index to patch.
+        /// - `word` - new lanes to install.
+        /// - `mask` - selects lanes to overwrite, padding is ignored.
         pub fn setWord(self: *Self, id: u32, word: Word, mask: Word) void {
             if (mask == 0) return;
             std.debug.assert(id < self.words.items.len);
@@ -258,6 +293,10 @@ pub fn BitSet(comptime wt: WordType) type {
             self.active_bits_counter = self.active_bits_counter - old_active + new_active;
         }
 
+        /// Writes one bit and moves the active counter.
+        /// - `self` - bitset to update.
+        /// - `id` - global bit position to write.
+        /// - `value` - state to store.
         pub fn setBit(self: *Self, id: u32, value: BitState) void {
             std.debug.assert(id < self.bits_count);
             const word_id = bw.bitToWordId(id);
@@ -274,6 +313,13 @@ pub fn BitSet(comptime wt: WordType) type {
             }
         }
 
+        /// Grows or shrinks the set while keeping counts and padding exact.
+        /// - `self` - bitset to resize.
+        /// - `allocator` - owns backing storage.
+        /// - `new_bits_count` - target valid bits.
+        /// - `created_bits_value` - state filling newly created bits.
+        ///
+        /// Return - error on allocation failure.
         pub fn resize(self: *Self, allocator: Allocator, new_bits_count: u32, created_bits_value: BitState) !void {
             const old_bits_count = self.bits_count;
             if (old_bits_count == new_bits_count) return;
@@ -1048,7 +1094,6 @@ test "BitSet iterateAll: parity with per-word step + oracle" {
             try t.expectEqualSlices(u32, exp_i[0..n_i], b.inactive[0..b.ni]);
         }
     }
-    // Early-exit prefix parity: ordered, so both stop at the same id.
     {
         var bs = BitSet(.u64){};
         defer bs.deinit(t.allocator);

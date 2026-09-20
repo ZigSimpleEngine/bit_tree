@@ -1,5 +1,7 @@
 const std = @import("std");
 
+/// Configures library modules, unit tests and the tree benchmark.
+/// - `b` - build graph that receives all steps and artifacts.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -15,7 +17,7 @@ pub fn build(b: *std.Build) void {
         "src/bit_set.zig",
         "src/layer.zig",
         "src/bit_word.zig",
-        "src/new_bit_tree.zig",
+        "src/bit_tree.zig",
     }) |src| {
         const unit_tests = b.addTest(.{
             .root_module = b.createModule(.{
@@ -27,18 +29,18 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }
 
-    const bench_ntree_exe = b.addExecutable(.{
-        .name = "bench_ntree",
+    const bench_bit_tree_exe = b.addExecutable(.{
+        .name = "bench_bit_tree",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench_ntree.zig"),
+            .root_source_file = b.path("src/bench_bit_tree.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
 
-    const run_bench_ntree = b.addRunArtifact(bench_ntree_exe);
-    if (b.args) |args| run_bench_ntree.addArgs(args);
+    const run_bench_bit_tree = b.addRunArtifact(bench_bit_tree_exe);
+    if (b.args) |args| run_bench_bit_tree.addArgs(args);
 
-    const bench_ntree_step = b.step("bench_ntree", "Run ntree benchmarks with history");
-    bench_ntree_step.dependOn(&run_bench_ntree.step);
+    const bench_bit_tree_step = b.step("bench_bit_tree", "Run tree benchmarks with history");
+    bench_bit_tree_step.dependOn(&run_bench_bit_tree.step);
 }

@@ -3,12 +3,21 @@ const math = std.math;
 const utilities = @import("utilities.zig");
 const BitState = utilities.BitState;
 
+/// Backing integer width shared by bitsets, layers and trees.
 pub const WordType = enum {
+    /// Eight-bit words, smallest memory footprint for tiny sets.
     u8,
+    /// Sixteen-bit words, compact storage for small cardinalities.
     u16,
+    /// Thirty-two-bit words, balanced width for mid-size sets.
     u32,
+    /// Sixty-four-bit words, fastest scans on 64-bit targets.
     u64,
 
+    /// Resolves the enum tag into its concrete unsigned integer type.
+    /// - `wt` - word width tag to convert.
+    ///
+    /// Return - matching u8/u16/u32/u64 type.
     pub fn Type(comptime wt: WordType) type {
         return switch (wt) {
             .u8 => u8,
@@ -19,111 +28,202 @@ pub const WordType = enum {
     }
 };
 
+/// Compile-time bit arithmetic kit for one word width.
+/// - `wt` - word width the generated helpers operate on.
+///
+/// Return - struct with shifts, masks and merge helpers.
 pub fn BitWord(comptime wt: WordType) type {
     return struct {
+        /// Echoes the configured width so generic code can branch on it.
         pub const word_type: WordType = wt;
+        /// Concrete unsigned integer used for backing storage.
         pub const Word: type = wt.Type();
+        /// All-ones word, base for building inverted masks.
         pub const max_value: Word = math.maxInt(Word);
+        /// Bits per word, drives all id conversions.
         pub const word_type_bits: u32 = @bitSizeOf(Word);
+        /// Shift that converts between bit and word ids.
         pub const shift_type_bits: u32 = math.log2_int(u32, word_type_bits);
+        /// Narrow index type that always fits inside one word.
         pub const Shift = @Int(.unsigned, shift_type_bits);
+        /// Largest valid intra-word index, used for remaining-bit math.
         pub const shift_max_value: Shift = word_type_bits - 1;
+        /// Clears low word bits to round an id down to a word start.
         pub const word_mask_inverted: u32 = ~(word_type_bits - 1);
 
+        /// Converts a global bit id into its containing word id.
+        /// - `bit_id` - global bit index.
+        ///
+        /// Return - word index holding the bit.
         pub inline fn bitToWordId(bit_id: u32) u32 {
             return bit_id >> shift_type_bits;
         }
 
+        /// Converts a word id into the global id of its first bit.
+        /// - `word_id` - word index to expand.
+        ///
+        /// Return - global bit id of the word start.
         pub inline fn wordToBitId(word_id: u32) u32 {
             return word_id << shift_type_bits;
         }
 
+        /// Rounds a bit id down to its word start for range scans.
+        /// - `bit_id` - global bit index to align.
+        ///
+        /// Return - first bit id of the containing word.
         pub inline fn floorBitId(bit_id: u32) u32 {
             return bit_id & word_mask_inverted;
         }
 
+        /// Extracts the intra-word offset of a global bit id.
+        /// - `bit_id` - global bit index to split.
+        ///
+        /// Return - position of the bit inside its word.
         pub inline fn bitIdInWord(bit_id: u32) Shift {
             return @truncate(bit_id);
         }
 
+        /// Counts bits remaining in the word from an offset upward.
+        /// - `bit_id` - global bit index whose tail is measured.
+        ///
+        /// Return - number of higher bits left in the same word.
         pub inline fn remainBitsInWord(bit_id: u32) Shift {
             return shift_max_value - bitIdInWord(bit_id);
         }
 
+        /// Computes how many words cover a bit count, rounding up.
+        /// - `bits_count` - number of valid bits to store.
+        ///
+        /// Return - backing word count with padding included.
         pub inline fn bitsToWordsCount(bits_count: u32) u32 {
             const val = @intFromBool(bitIdInWord(bits_count) > 0);
             return bitToWordId(bits_count - val) + val;
         }
 
-        /// start zone = 1 (low bits_count bits), remaining = 0
+        /// Builds a mask with low bits set for partial-word bounds.
+        /// - `bits_count` - number of low bits to enable.
+        ///
+        /// Return - mask with exactly the low bits set.
         pub inline fn maskStart(bits_count: Shift) Word {
             return ~(max_value << bits_count);
         }
 
-        /// end zone = 1 (high bits_count bits), remaining = 0
+        /// Builds a mask with high bits set for partial-word bounds.
+        /// - `bits_count` - number of high bits to enable.
+        ///
+        /// Return - mask with exactly the high bits set.
         pub inline fn maskEnd(bits_count: Shift) Word {
             return ~(max_value >> bits_count);
         }
 
-        /// start = 1, center = 0, end = 1
+        /// Builds an edge mask that keeps both ends and clears the middle.
+        /// - `start_bits` - number of low bits to enable.
+        /// - `end_bits` - number of high bits to enable.
+        ///
+        /// Return - combined start and end mask.
         pub inline fn maskStartEnd(start_bits: Shift, end_bits: Shift) Word {
             return maskStart(start_bits) | maskEnd(end_bits);
         }
 
-        /// start zone = 0 (low bits_count bits), remaining = 1
+        /// Builds an inverted start mask that clears low bits.
+        /// - `bits_count` - number of low bits to clear.
+        ///
+        /// Return - mask with low bits cleared.
         pub inline fn maskStartInverted(bits_count: Shift) Word {
             return max_value << bits_count;
         }
 
-        /// end zone = 0 (high bits_count bits), remaining = 1
+        /// Builds an inverted end mask that clears high bits.
+        /// - `bits_count` - number of high bits to clear.
+        ///
+        /// Return - mask with high bits cleared.
         pub inline fn maskEndInverted(bits_count: Shift) Word {
             return max_value >> bits_count;
         }
 
-        /// start = 0, center = 1, end = 0
+        /// Builds a middle mask that keeps the center and clears edges.
+        /// - `start_bits` - number of low bits to clear.
+        /// - `end_bits` - number of high bits to clear.
+        ///
+        /// Return - mask with only the middle bits set.
         pub inline fn maskStartEndInverted(start_bits: Shift, end_bits: Shift) Word {
             return maskStart(start_bits) & maskEnd(end_bits);
         }
 
+        /// Saturating inverted start mask that tolerates full-range counts.
+        /// - `count` - number of low bits to clear, clamps at word size.
+        ///
+        /// Return - cleared-low mask, zero when the count covers the word.
         pub inline fn maskStartInvertedClamped(count: u32) Word {
             return if (count >= word_type_bits) 0 else maskStartInverted(@truncate(count));
         }
 
+        /// Saturating inverted end mask that tolerates full-range counts.
+        /// - `count` - number of high bits to clear, clamps at word size.
+        ///
+        /// Return - cleared-high mask, zero when the count covers the word.
         pub inline fn maskEndInvertedClamped(count: u32) Word {
             return if (count >= word_type_bits) 0 else maskEndInverted(@truncate(count));
         }
 
+        /// Saturating middle mask with full-range start and end counts.
+        /// - `start_count` - low bits to clear, clamps at word size.
+        /// - `end_count` - high bits to clear, clamps at word size.
+        ///
+        /// Return - middle mask valid for any u32 counts.
         pub inline fn maskStartEndInvertedClamped(start_count: u32, end_count: u32) Word {
             return maskStartInvertedClamped(start_count) | maskEndInvertedClamped(end_count);
         }
 
-        /// Mask with the low `count` bits set: 0 -> 0, >= word_bits -> all ones.
-        /// Saturating `maskStart` generalized from `Shift` to full `u32` range.
+        /// Saturating start mask that tolerates full-range counts.
+        /// - `count` - number of low bits to set, clamps at word size.
+        ///
+        /// Return - low mask, all ones when the count covers the word.
         pub inline fn maskStartClamped(count: u32) Word {
             return if (count >= word_type_bits) max_value else maskStart(@truncate(count));
         }
 
-        /// Mask with the high `count` bits set: 0 -> 0, >= word_bits -> all ones.
-        /// Saturating `maskEnd` generalized from `Shift` to full `u32` range.
+        /// Saturating end mask that tolerates full-range counts.
+        /// - `count` - number of high bits to set, clamps at word size.
+        ///
+        /// Return - high mask, all ones when the count covers the word.
         pub inline fn maskEndClamped(count: u32) Word {
             return if (count >= word_type_bits) max_value else maskEnd(@truncate(count));
         }
 
-        /// start = 1, center = 0, end = 1 with `u32` counts.
-        /// Saturating `maskStartEnd`: overlapping edges collapse to all ones.
+        /// Saturating edge mask with full-range start and end counts.
+        /// - `start_count` - low bits to set, clamps at word size.
+        /// - `end_count` - high bits to set, clamps at word size.
+        ///
+        /// Return - combined edge mask valid for any u32 counts.
         pub inline fn maskStartEndClamped(start_count: u32, end_count: u32) Word {
             return maskStartClamped(start_count) | maskEndClamped(end_count);
         }
 
-        /// zero = 0, one = 1,
+        /// Selects bits from two words under a mask without branches.
+        /// - `zero` - source for cleared mask bits.
+        /// - `one` - source for set mask bits.
+        /// - `mask` - selects which source each position takes.
+        ///
+        /// Return - merged word with masked lanes from one.
         pub inline fn merge(zero: Word, one: Word, mask: Word) Word {
             return zero ^ ((zero ^ one) & mask);
         }
 
+        /// Reads one bit as a logical active/inactive state.
+        /// - `word` - backing word to sample.
+        /// - `bit_id_in_word` - intra-word position to read.
+        ///
+        /// Return - decoded bit state.
         pub inline fn readBitState(word: Word, bit_id_in_word: Shift) BitState {
             return @enumFromInt(@as(u1, @truncate(word >> bit_id_in_word)));
         }
 
+        /// Reads one raw bit as u1 for arithmetic fast paths.
+        /// - `word` - backing word to sample.
+        /// - `bit_id_in_word` - intra-word position to read.
+        ///
+        /// Return - raw bit value.
         pub inline fn readBit(word: Word, bit_id_in_word: Shift) u1 {
             return @truncate(word >> bit_id_in_word);
         }
@@ -144,7 +244,6 @@ test "BitWord u64" {
     const bits_to_words_count = [in.len]u32{ 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 157 };
 
     for (in, 0..) |value, i| {
-        // print("i: {}\n", .{i});
         try t.expectEqual(bit_to_word_id[i], BitWord64.bitToWordId(value));
         try t.expectEqual(word_to_bit_id[i], BitWord64.wordToBitId(value));
         try t.expectEqual(floor_bit_id[i], BitWord64.floorBitId(value));

@@ -12,6 +12,10 @@ const iterateWordInline = utilities.iterateActiveBitsInWordInline;
 const BitState = utilities.BitState;
 const WordType = bit_word.WordType;
 
+/// Pyramid level that summarizes one bit plane into activity and mixed planes.
+/// - `wt` - word width for backing storage.
+///
+/// Return - level type with counters and word-wise iteration.
 pub fn Layer(comptime wt: WordType) type {
     const Word = wt.Type();
     const bw = bit_word.BitWord(wt);
@@ -19,59 +23,111 @@ pub fn Layer(comptime wt: WordType) type {
     return struct {
         const Self = @This();
 
+        /// Activity plane, one bit per summarized position.
         activity: ListA64(Word) = .empty,
+        /// Mixed plane, marks positions whose children disagree.
         mixed: ListA64(Word) = .empty,
+        /// Valid positions in this level, excludes padding bits.
         bits_count: u32 = 0,
+        /// Per-state totals indexed by State tag, kept incrementally.
         state_counters: [4]u32 = .{ 0, 0, 0, 0 },
 
+        /// Four-state summary of a child group used by upper levels.
         pub const State = enum(u2) {
+            /// All children cleared, safe to skip for active scans.
             inactive = 0,
+            /// All children set, safe to bulk-visit for active scans.
             active = 1,
+            /// Children disagree above the leaf, requires descent.
             mixed = 2,
+            /// Leaf word is internally mixed, requires bit-level scan.
             deep_mixed = 3,
 
+            /// Numeric alias for inactive used in packed arithmetic.
             pub const inactive_u2: u2 = 0;
+            /// Numeric alias for active used in packed arithmetic.
             pub const active_u2: u2 = 1;
+            /// Numeric alias for mixed used in packed arithmetic.
             pub const mixed_u2: u2 = 2;
+            /// Numeric alias for deep_mixed used in packed arithmetic.
             pub const deep_mixed_u2: u2 = 3;
 
+            /// Array index for inactive counters.
             pub const inactive_u32: u32 = 0;
+            /// Array index for active counters.
             pub const active_u32: u32 = 1;
+            /// Array index for mixed counters.
             pub const mixed_u32: u32 = 2;
+            /// Array index for deep_mixed counters.
             pub const deep_mixed_u32: u32 = 3;
 
+            /// Packs two raw planes into one two-bit state code.
+            /// - `activity` - raw activity bit.
+            /// - `mixed` - raw mixed bit.
+            ///
+            /// Return - packed state value matching the enum layout.
             pub inline fn fromBits(activity: u1, mixed: u1) u2 {
                 const b0: u2 = activity;
                 const b1: u2 = @as(u2, mixed) << 1;
                 return b0 | b1;
             }
 
+            /// Combines two logical states into one summary state.
+            /// - `activity` - logical activity value.
+            /// - `mixed` - logical mixed value.
+            ///
+            /// Return - decoded summary state.
             pub inline fn fromBitsState(activity: BitState, mixed: BitState) State {
                 const b0: u2 = @intFromEnum(activity);
                 const b1: u2 = @as(u2, @intFromEnum(mixed)) << 1;
                 return @enumFromInt(b0 | b1);
             }
 
+            /// Extracts the activity lane of a summary state.
+            /// - `self` - summary state to split.
+            ///
+            /// Return - logical activity value.
             pub inline fn activityBit(self: State) BitState {
                 const b0: u1 = @truncate(@as(u2, @intFromEnum(self)));
                 return @enumFromInt(b0);
             }
 
+            /// Extracts the mixed lane of a summary state.
+            /// - `self` - summary state to split.
+            ///
+            /// Return - logical mixed value.
             pub inline fn mixedBit(self: State) BitState {
                 const b0: u1 = @truncate(@as(u2, @intFromEnum(self)) >> 1);
                 return @enumFromInt(b0);
             }
         };
 
-        pub const StateCounts = struct { inactive: u32, active: u32, mixed: u32, deep: u32 };
+        /// Counted states inside one masked word for counter updates.
+        pub const StateCounts = struct {
+            /// Cleared positions counted in the mask.
+            inactive: u32,
+            /// Set positions counted in the mask.
+            active: u32,
+            /// Disagreeing positions counted in the mask.
+            mixed: u32,
+            /// Deeply mixed positions counted in the mask.
+            deep: u32,
+        };
 
+        /// Bundles a level pointer with caller context for iteration.
+        /// - `Context` - caller-provided iteration context.
+        ///
+        /// Return - pairing struct passed to every step call.
         pub fn LayerWithContext(Context: type) type {
             return struct {
+                /// Level being scanned, provides activity and mixed planes.
                 layer: *Self,
+                /// Caller context forwarded to per-bit callbacks.
                 context: Context,
             };
         }
 
+        /// Builds a word-wise visitor that dispatches by four-state summary.
         pub fn Iterator(
             comptime Context: type,
             comptime on_inactive: InlineIteratorCallback(Context),
@@ -80,6 +136,11 @@ pub fn Layer(comptime wt: WordType) type {
             comptime on_deep_mixed: InlineIteratorCallback(Context),
         ) type {
             return struct {
+                /// Visits one word and routes each valid bit to its state callback.
+                /// - `data` - level and caller context.
+                /// - `word_id` - word index to scan.
+                ///
+                /// Return - false on early exit, true when the word completed.
                 pub inline fn step(data: LayerWithContext(Context), word_id: u32) bool {
                     if (on_inactive != null and on_active != null and on_mixed != null and on_deep_mixed != null) {
                         return stepFull(data, word_id);
@@ -88,6 +149,11 @@ pub fn Layer(comptime wt: WordType) type {
                     }
                 }
 
+                /// Fast path when all four callbacks exist, scans linearly by bound.
+                /// - `data` - level and caller context.
+                /// - `word_id` - word index to scan.
+                ///
+                /// Return - false on early exit, true when the word completed.
                 inline fn stepFull(data: LayerWithContext(Context), word_id: u32) bool {
                     const layer = data.layer;
                     const context = data.context;
@@ -128,6 +194,11 @@ pub fn Layer(comptime wt: WordType) type {
                     return true;
                 }
 
+                /// Selective path that peels only states with installed callbacks.
+                /// - `data` - level and caller context.
+                /// - `word_id` - word index to scan.
+                ///
+                /// Return - false on early exit, true when the word completed.
                 inline fn stepPending(data: LayerWithContext(Context), word_id: u32) bool {
                     const layer = data.layer;
                     const context = data.context;
@@ -197,11 +268,20 @@ pub fn Layer(comptime wt: WordType) type {
             };
         }
 
+        /// Releases both backing planes.
+        /// - `self` - level to destroy.
+        /// - `allocator` - allocator that owns the planes.
         pub fn deinit(self: *Self, allocator: Allocator) void {
             self.activity.deinit(allocator);
             self.mixed.deinit(allocator);
         }
 
+        /// Writes masked lanes of both planes and refreshes counters.
+        /// - `self` - level to update.
+        /// - `id` - word index to patch.
+        /// - `activity` - new activity lanes.
+        /// - `mixed` - new mixed lanes.
+        /// - `mask` - selects lanes to overwrite.
         pub fn setWord(self: *Self, id: u32, activity: Word, mixed: Word, mask: Word) void {
             if (mask == 0) return;
             std.debug.assert(id < self.activity.items.len);
@@ -233,6 +313,10 @@ pub fn Layer(comptime wt: WordType) type {
             self.state_counters[State.deep_mixed_u32] = self.state_counters[State.deep_mixed_u32] - o.deep + n.deep;
         }
 
+        /// Writes one summary position and moves its counter.
+        /// - `self` - level to update.
+        /// - `id` - bit position to write.
+        /// - `value` - summary state to store.
         pub fn setBit(self: *Self, id: u32, value: State) void {
             std.debug.assert(id < self.bits_count);
             const word_id = bw.bitToWordId(id);
@@ -259,6 +343,13 @@ pub fn Layer(comptime wt: WordType) type {
             self.state_counters[@intFromEnum(value)] += 1;
         }
 
+        /// Grows or shrinks both planes while keeping counters exact.
+        /// - `self` - level to resize.
+        /// - `allocator` - owns backing storage.
+        /// - `new_bits_count` - target valid positions.
+        /// - `created_bits_value` - state filling newly created positions.
+        ///
+        /// Return - error on allocation failure.
         pub fn resize(
             self: *Self,
             allocator: Allocator,
@@ -363,6 +454,12 @@ pub fn Layer(comptime wt: WordType) type {
             }
         }
 
+        /// Counts four states inside one masked word with popcounts.
+        /// - `activity` - activity word to classify.
+        /// - `mixed` - mixed word to classify.
+        /// - `mask` - selects valid lanes only.
+        ///
+        /// Return - per-state totals for the mask.
         inline fn countStates(activity: Word, mixed: Word, mask: Word) StateCounts {
             const a = activity & mask;
             const m = mixed & mask;

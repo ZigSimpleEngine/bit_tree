@@ -1,42 +1,49 @@
-/// ntree-only пробег сценариев: замеряется только NewTree
-/// (new_bit_tree.zig). BitSet (bit_set.zig) строится рядом лишь как
-/// независимый оракул: сверяем только результат (множество id +
-/// суммы/счётчики, порядок обхода и код возврата step не проверяются),
-/// чтобы ловить расхождения.
-/// fill-строки меряют fill именно ntree.
-///
-/// История: после каждого прогона ms/ряд дописывается в текстовый файл
-/// bench_ntree_history.txt (формат v2: `#`-комментарии, далее строки
-/// `<name> <ms_prev...>`, ms на rep, 6 знаков, oldest-first, хранится
-/// максимум 8 последних; файл без v2-шапки игнорируется — чистый старт). При следующем прогоне таблица показывает
-/// до 8 предыдущих колонок + текущую + xPrev = prev_last / cur
-/// (>1 = стало быстрее).
-/// zig build bench_ntree -Doptimize=ReleaseFast
 const std = @import("std");
 const bit_set = @import("bit_set.zig");
 const utilities = @import("utilities.zig");
-const new_bit_tree = @import("new_bit_tree.zig");
+const bit_tree = @import("bit_tree.zig");
 
+/// Allocator type that owns benchmark and history buffers.
 const Allocator = std.mem.Allocator;
+/// Reference flat set used only to verify tree results.
 const Oracle = bit_set.BitSet(.u64);
+/// Logical bit value selecting active or inactive benchmarks.
 const BitState = utilities.BitState;
-const NewTree = new_bit_tree.BitTree(.u64);
+/// Measured hierarchical tree built from identical inputs.
+const Tree = bit_tree.BitTree(.u64);
 
-const HISTORY_PATH = "bench_ntree_history.txt";
+/// History file holding past ms/rep columns for trend comparison.
+const HISTORY_PATH = "bench_bit_tree_history.txt";
+/// Maximum history columns shown before old runs roll off.
 const MAX_PREV_COLS: usize = 8;
 
+/// Monotonic timer that stamps benchmark intervals in nanoseconds.
 const Stopwatch = struct {
+    /// I/O context providing the monotonic clock source.
     io: std.Io,
+    /// Start stamp captured when the interval begins.
     t0: std.Io.Timestamp,
+    /// Captures the start stamp for one measured interval.
+    /// - `io` - clock source for timestamps.
+    ///
+    /// Return - running timer holding the start point.
     fn start(io: std.Io) @This() {
         return .{ .io = io, .t0 = std.Io.Timestamp.now(io, .awake) };
     }
+    /// Reads elapsed nanoseconds since start.
+    /// - `self` - running timer to sample.
+    ///
+    /// Return - elapsed nanoseconds as an integer.
     fn read(self: *@This()) u64 {
         const t1 = std.Io.Timestamp.now(self.io, .awake);
         return @intCast(std.Io.Timestamp.durationTo(self.t0, t1).nanoseconds);
     }
 };
 
+/// Fills the oracle with a strided active pattern.
+/// - `oracle` - reference set to populate.
+/// - `stride` - distance between active bits.
+/// - `offset` - first active position.
 fn fillStride(oracle: *Oracle, stride: u32, offset: u32) void {
     var b: u32 = offset;
     while (b < oracle.bits_count) : (b += stride) {
@@ -44,13 +51,22 @@ fn fillStride(oracle: *Oracle, stride: u32, offset: u32) void {
     }
 }
 
-fn fillNewStride(tree: *NewTree, stride: u32, offset: u32) void {
+/// Fills the measured tree with the same strided pattern as the oracle.
+/// - `tree` - tree to populate.
+/// - `stride` - distance between active bits.
+/// - `offset` - first active position.
+fn fillTreeStride(tree: *Tree, stride: u32, offset: u32) void {
     var b: u32 = offset;
     while (b < tree.bitset.bits_count) : (b += stride) {
         tree.setBit(b, .active);
     }
 }
 
+/// Fills the oracle with clustered runs separated by gaps.
+/// - `oracle` - reference set to populate.
+/// - `run` - active bits per cluster.
+/// - `gap` - inactive bits between clusters.
+/// - `offset` - first cluster start.
 fn fillClustered(oracle: *Oracle, run: u32, gap: u32, offset: u32) void {
     const total: u64 = oracle.bits_count;
     var b: u64 = offset;
@@ -64,7 +80,11 @@ fn fillClustered(oracle: *Oracle, run: u32, gap: u32, offset: u32) void {
     }
 }
 
-fn fillNewClustered(tree: *NewTree, run: u32, gap: u32) void {
+/// Fills the measured tree with clustered runs matching the oracle.
+/// - `tree` - tree to populate.
+/// - `run` - active bits per cluster.
+/// - `gap` - inactive bits between clusters.
+fn fillTreeClustered(tree: *Tree, run: u32, gap: u32) void {
     const total: u64 = tree.bitset.bits_count;
     var b: u64 = 0;
     while (b < total) {
@@ -77,8 +97,11 @@ fn fillNewClustered(tree: *NewTree, run: u32, gap: u32) void {
     }
 }
 
-/// Короткие числа в именах тестов, чтобы не ломать layout колонок:
-/// 1000->1K, 1000000->1M; неделимые на 1000 — как есть (1024, 997).
+/// Shortens large counts for fixed-width row names.
+/// - `buf` - scratch buffer receiving the formatted name.
+/// - `n` - raw count to shorten.
+///
+/// Return - slice of the buffer with the short name.
 fn fmtCount(buf: []u8, n: u32) ![]u8 {
     if (n >= 1_000_000 and n % 1_000_000 == 0) {
         return std.fmt.bufPrint(buf, "{d}M", .{n / 1_000_000});
@@ -89,7 +112,11 @@ fn fmtCount(buf: []u8, n: u32) ![]u8 {
     return std.fmt.bufPrint(buf, "{d}", .{n});
 }
 
-/// Нетаймированный однопроходный оракул по BitSet: только для сверки сумм.
+/// Computes reference sums by scanning oracle words once.
+/// - `oracle` - reference set to scan.
+/// - `want` - which state contributes to the totals.
+///
+/// Return - summed ids and matching counts.
 fn oracleSumOnce(oracle: *const Oracle, want: BitState) struct { sum: u64, count: u64 } {
     var sum: u64 = 0;
     var count: u64 = 0;
@@ -112,14 +139,17 @@ fn oracleSumOnce(oracle: *const Oracle, want: BitState) struct { sum: u64, count
     return .{ .sum = sum, .count = count };
 }
 
+/// Pinned per-id accumulator that prevents bulk-sum folding.
 const SumCtx = struct {
+    /// Summed ids, pinned so every visit must materialize.
     sum: u64 = 0,
+    /// Visited count, validates cardinalities against the oracle.
     count: u64 = 0,
-    // Каждый id — через opaque use: bulk-путь step отдаёт id плотным
-    // range-циклом с прозрачным колбэком, и LLVM сворачивает
-    // sum += id в O(1)-арифметику (корректные суммы за ~15нс вместо
-    // обхода). Пин каждого id делает свёртку невозможной: цикл обязан
-    // материализовать все id. См. verify: там honesty дают heap-записи.
+    /// Adds one visited id while pinning it against optimization.
+    /// - `self` - accumulator receiving the id.
+    /// - `id` - visited bit id.
+    ///
+    /// Return - always true to continue the scan.
     inline fn addInline(self: *SumCtx, id: u32) bool {
         std.mem.doNotOptimizeAway(id);
         self.sum += id;
@@ -128,15 +158,18 @@ const SumCtx = struct {
     }
 };
 
-/// Замеряемый leg: NewTree Iterator стримит id в суммирующий колбэк.
-/// Решение predictsFlat хоистится один раз на сценарий (дерево во время
-/// замера неменяемо), ветка — ВНЕ rep-цикла: решение внутри hot-функции
-/// рядом с word loop душит оптимизацию за opaque use (см. NOTE в new_bit_tree).
-fn benchNtree(io: std.Io, tree: *NewTree, comptime want: BitState, reps: u32) struct { sum: u64, count: u64, ns: u64 } {
-    const It = NewTree.Iterator(*SumCtx, SumCtx.addInline, null);
-    const ItI = NewTree.Iterator(*SumCtx, null, SumCtx.addInline);
+/// Times the predicted tree arm with per-id pinning over repetitions.
+/// - `io` - clock source for the interval.
+/// - `tree` - measured tree, immutable during timing.
+/// - `want` - which state is benchmarked.
+/// - `reps` - timed repetitions.
+///
+/// Return - pinned sums, counts and total nanoseconds.
+fn benchTree(io: std.Io, tree: *Tree, comptime want: BitState, reps: u32) struct { sum: u64, count: u64, ns: u64 } {
+    const It = Tree.Iterator(*SumCtx, SumCtx.addInline, null);
+    const ItI = Tree.Iterator(*SumCtx, null, SumCtx.addInline);
     const use_flat = if (want == .active) It.predictsFlat(tree) else ItI.predictsFlat(tree);
-    new_bit_tree.last_predict_used_flat = use_flat;
+    bit_tree.last_predict_used_flat = use_flat;
     var watch = Stopwatch.start(io);
     var sum: u64 = 0;
     var count: u64 = 0;
@@ -165,37 +198,50 @@ fn benchNtree(io: std.Io, tree: *NewTree, comptime want: BitState, reps: u32) st
             count += c.count;
         }
     }
-    // Пиним дата-зависимые итоги, а не только bool: иначе LLVM доказывает
-    // done=true (колбэк всегда true) и выкидывает весь цикл в ReleaseFast,
-    // а суммы уходят лишь в выключенный assert. Итоги — функция от слов
-    // в памяти, их материализация требует реального обхода.
     std.mem.doNotOptimizeAway(sum);
     std.mem.doNotOptimizeAway(count);
     return .{ .sum = sum, .count = count, .ns = watch.read() };
 }
 
+/// One benchmark row with timing and winning path.
 const Row = struct {
+    /// Scenario label shown in the result table.
     name: []const u8,
+    /// Matching elements, validates workload size.
     elements: u64,
+    /// Milliseconds per repetition, the compared metric.
     ms: f64,
+    /// Predicted path flag, null when the scenario has no choice.
     flat: ?bool = null,
 };
 
+/// Heap-backed collector that records visited ids for set comparison.
 const VerifyCtx = struct {
+    /// Output list receiving every visited id.
     list: *std.ArrayListUnmanaged(u32),
-    fn push(ctx: *VerifyCtx, id: u32) callconv(.@"inline") bool {
+    /// Appends one visited id without reallocation checks in hot code.
+    /// - `ctx` - collector receiving the id.
+    /// - `id` - visited bit id.
+    ///
+    /// Return - always true to continue the scan.
+    inline fn push(ctx: *VerifyCtx, id: u32) bool {
         ctx.list.appendAssumeCapacity(id);
         return true;
     }
 };
 
-/// Разовая нетаймированная проверка результата сценария: id, отданные
-/// итератором, как множество (порядок обхода не важен) + суммы/счётчики —
-/// против независимого оракула из BitSet. Код возврата step не проверяется.
-fn verifyNtree(
+/// Checks tree ids and sums against the oracle as unordered sets.
+/// - `alloc` - owns temporary id lists.
+/// - `oracle` - reference set defining expected ids.
+/// - `tree` - measured tree to verify.
+/// - `want` - which state is compared.
+/// - `name` - scenario label for mismatch reports.
+///
+/// Return - error on id or sum mismatch.
+fn verifyTree(
     alloc: Allocator,
     oracle: *const Oracle,
-    ntree: *NewTree,
+    tree: *Tree,
     comptime want: BitState,
     name: []const u8,
 ) !void {
@@ -224,12 +270,12 @@ fn verifyNtree(
     try got.ensureTotalCapacity(alloc, exp.items.len);
     {
         var vc = VerifyCtx{ .list = &got };
-        const It = NewTree.Iterator(*VerifyCtx, VerifyCtx.push, null);
-        const ItI = NewTree.Iterator(*VerifyCtx, null, VerifyCtx.push);
+        const It = Tree.Iterator(*VerifyCtx, VerifyCtx.push, null);
+        const ItI = Tree.Iterator(*VerifyCtx, null, VerifyCtx.push);
         if (want == .active) {
-            _ = It.iterateAll(.{ .tree = ntree, .context = &vc });
+            _ = It.iterateAll(.{ .tree = tree, .context = &vc });
         } else {
-            _ = ItI.iterateAll(.{ .tree = ntree, .context = &vc });
+            _ = ItI.iterateAll(.{ .tree = tree, .context = &vc });
         }
     }
     if (got.items.len != exp.items.len) {
@@ -249,38 +295,54 @@ fn verifyNtree(
     }
 }
 
-/// Один сценарий на идентичном oracle/ntree содержимом: сначала разовая
-/// сверка результата (id + суммы, без привязки к step), затем таймится
-/// только ntree. Результат (ms на rep) кладётся в rows, печать — общей
-/// таблицей после прогона.
+/// Verifies once then times a single scenario and appends its row.
+/// - `io` - clock source for timing.
+/// - `alloc` - owns row names.
+/// - `rows` - table collecting every scenario result.
+/// - `name` - scenario label for the table.
+/// - `oracle` - reference set for verification.
+/// - `tree` - measured tree for timing.
+/// - `want` - which state is benchmarked.
+/// - `reps` - timed repetitions.
+///
+/// Return - error on verification or allocation failure.
 fn benchOne(
     io: std.Io,
     alloc: Allocator,
     rows: *std.ArrayListUnmanaged(Row),
     name: []const u8,
     oracle: *const Oracle,
-    ntree: *NewTree,
+    tree: *Tree,
     comptime want: BitState,
     reps: u32,
 ) !void {
-    try verifyNtree(alloc, oracle, ntree, want, name);
+    try verifyTree(alloc, oracle, tree, want, name);
     {
         var c = SumCtx{};
-        const It = NewTree.Iterator(*SumCtx, SumCtx.addInline, null);
-        const ItI = NewTree.Iterator(*SumCtx, null, SumCtx.addInline);
+        const It = Tree.Iterator(*SumCtx, SumCtx.addInline, null);
+        const ItI = Tree.Iterator(*SumCtx, null, SumCtx.addInline);
         const done = if (want == .active)
-            It.iterateAll(.{ .tree = ntree, .context = &c })
+            It.iterateAll(.{ .tree = tree, .context = &c })
         else
-            ItI.iterateAll(.{ .tree = ntree, .context = &c });
+            ItI.iterateAll(.{ .tree = tree, .context = &c });
         std.mem.doNotOptimizeAway(done);
     }
     const exp = oracleSumOnce(oracle, want);
-    const got = benchNtree(io, ntree, want, reps);
+    const got = benchTree(io, tree, want, reps);
     std.debug.assert(exp.sum * reps == got.sum and exp.count * reps == got.count);
     const ms: f64 = @as(f64, @floatFromInt(got.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0;
-    try rows.append(alloc, .{ .name = try alloc.dupe(u8, name), .elements = exp.count, .ms = ms, .flat = new_bit_tree.last_predict_used_flat });
+    try rows.append(alloc, .{ .name = try alloc.dupe(u8, name), .elements = exp.count, .ms = ms, .flat = bit_tree.last_predict_used_flat });
 }
 
+/// Builds identical strided inputs and benchmarks one density point.
+/// - `io` - clock source for timing.
+/// - `alloc` - owns row names.
+/// - `rows` - table collecting results.
+/// - `bits_total` - total bits in both containers.
+/// - `stride` - distance between active bits.
+/// - `reps` - timed repetitions.
+///
+/// Return - error on verification or allocation failure.
 fn benchThreshold(
     io: std.Io,
     alloc: Allocator,
@@ -291,12 +353,12 @@ fn benchThreshold(
 ) !void {
     var oracle = Oracle{};
     defer oracle.deinit(alloc);
-    var ntree = NewTree{};
-    defer ntree.deinit(alloc);
+    var tree = Tree{};
+    defer tree.deinit(alloc);
     try oracle.resize(alloc, bits_total, .inactive);
-    try ntree.resize(alloc, bits_total, .inactive);
+    try tree.resize(alloc, bits_total, .inactive);
     fillStride(&oracle, stride, 0);
-    fillNewStride(&ntree, stride, 0);
+    fillTreeStride(&tree, stride, 0);
     var name_buf: [64]u8 = undefined;
     var sbuf: [16]u8 = undefined;
     var nbuf: [16]u8 = undefined;
@@ -304,9 +366,19 @@ fn benchThreshold(
         try fmtCount(&sbuf, stride),
         try fmtCount(&nbuf, bits_total),
     });
-    try benchOne(io, alloc, rows, name, &oracle, &ntree, .active, reps);
+    try benchOne(io, alloc, rows, name, &oracle, &tree, .active, reps);
 }
 
+/// Builds identical clustered inputs and benchmarks one shape point.
+/// - `io` - clock source for timing.
+/// - `alloc` - owns row names.
+/// - `rows` - table collecting results.
+/// - `bits_total` - total bits in both containers.
+/// - `run` - active bits per cluster.
+/// - `gap` - inactive bits between clusters.
+/// - `reps` - timed repetitions.
+///
+/// Return - error on verification or allocation failure.
 fn benchCluster(
     io: std.Io,
     alloc: Allocator,
@@ -318,12 +390,12 @@ fn benchCluster(
 ) !void {
     var oracle = Oracle{};
     defer oracle.deinit(alloc);
-    var ntree = NewTree{};
-    defer ntree.deinit(alloc);
+    var tree = Tree{};
+    defer tree.deinit(alloc);
     try oracle.resize(alloc, bits_total, .inactive);
-    try ntree.resize(alloc, bits_total, .inactive);
+    try tree.resize(alloc, bits_total, .inactive);
     fillClustered(&oracle, run, gap, 0);
-    fillNewClustered(&ntree, run, gap);
+    fillTreeClustered(&tree, run, gap);
     var name_buf: [64]u8 = undefined;
     var rbuf: [16]u8 = undefined;
     var gbuf: [16]u8 = undefined;
@@ -333,11 +405,19 @@ fn benchCluster(
         try fmtCount(&gbuf, gap),
         try fmtCount(&nbuf, bits_total),
     });
-    try benchOne(io, alloc, rows, name, &oracle, &ntree, .active, reps);
+    try benchOne(io, alloc, rows, name, &oracle, &tree, .active, reps);
 }
 
-/// Write path ntree: свежее дерево + per-bit setBit. Средний fill и
-/// число элементов — строкой в общую таблицу (та же ms/ряд семантика).
+/// Times fresh-tree construction with per-bit inserts.
+/// - `io` - clock source for timing.
+/// - `alloc` - owns temporary trees.
+/// - `rows` - table collecting results.
+/// - `bits_total` - tree size per repetition.
+/// - `stride` - distance between inserted bits.
+/// - `offset` - first inserted position.
+/// - `reps` - timed repetitions.
+///
+/// Return - error on allocation failure.
 fn benchFill(
     io: std.Io,
     alloc: Allocator,
@@ -351,7 +431,7 @@ fn benchFill(
     var check: u64 = 0;
     var r: u32 = 0;
     while (r < reps) : (r += 1) {
-        var tree = NewTree{};
+        var tree = Tree{};
         try tree.resize(alloc, bits_total, .inactive);
         var b: u32 = offset;
         while (b < bits_total) : (b += stride) {
@@ -372,11 +452,19 @@ fn benchFill(
     try rows.append(alloc, .{ .name = try alloc.dupe(u8, name), .elements = check / reps, .ms = ns / 1_000_000.0 });
 }
 
+/// Past timings for one scenario kept oldest-first for trends.
 const HistEntry = struct {
+    /// Scenario label matching current row names.
     name: []const u8,
+    /// Previous ms/rep values, capped to recent runs.
     vals: std.ArrayListUnmanaged(f64),
 };
 
+/// Finds history for one scenario by name.
+/// - `hists` - loaded history entries.
+/// - `name` - scenario label to locate.
+///
+/// Return - index when found, null otherwise.
 fn findHist(hists: []const HistEntry, name: []const u8) ?usize {
     for (hists, 0..) |h, i| {
         if (std.mem.eql(u8, h.name, name)) return i;
@@ -384,6 +472,11 @@ fn findHist(hists: []const HistEntry, name: []const u8) ?usize {
     return null;
 }
 
+/// Loads prior timings, ignoring missing or non-v2 history files.
+/// - `io` - file-system context for reading.
+/// - `alloc` - owns history names and values.
+///
+/// Return - history entries, empty on fresh start.
 fn loadHistory(io: std.Io, alloc: Allocator) std.ArrayListUnmanaged(HistEntry) {
     var hists: std.ArrayListUnmanaged(HistEntry) = .empty;
     const content = std.Io.Dir.cwd().readFileAlloc(io, HISTORY_PATH, alloc, .limited(4 * 1024 * 1024)) catch |err| {
@@ -393,9 +486,7 @@ fn loadHistory(io: std.Io, alloc: Allocator) std.ArrayListUnmanaged(HistEntry) {
         return hists;
     };
     defer alloc.free(content);
-    // v1 недействительна: там смесь чисел от старой реализации step и
-    // свёрнутых (~нс) замеров до per-id пиннинга. Без v2-шапки — чистый старт.
-    if (!std.mem.containsAtLeast(u8, content, 1, "# bench_ntree history v2")) {
+    if (!std.mem.containsAtLeast(u8, content, 1, "# bench_bit_tree history v2")) {
         std.debug.print("note: {s} is not v2 history, starting fresh\n", .{HISTORY_PATH});
         return hists;
     }
@@ -428,13 +519,16 @@ fn loadHistory(io: std.Io, alloc: Allocator) std.ArrayListUnmanaged(HistEntry) {
     return hists;
 }
 
+/// Prints current timings aligned with up to eight history columns.
+/// - `rows` - current benchmark results.
+/// - `hists` - prior timings for comparison.
 fn printTable(rows: []const Row, hists: []const HistEntry) void {
     var prev_cols: usize = 0;
     for (rows) |row| {
         const n: usize = if (findHist(hists, row.name)) |idx| hists[idx].vals.items.len else 0;
         prev_cols = @max(prev_cols, @min(n, MAX_PREV_COLS));
     }
-    std.debug.print("ntree bench (ms/rep), history: {s} (prev runs kept: up to {d})\n", .{ HISTORY_PATH, MAX_PREV_COLS });
+    std.debug.print("tree bench (ms/rep), history: {s} (prev runs kept: up to {d})\n", .{ HISTORY_PATH, MAX_PREV_COLS });
     std.debug.print("{s:<26} {s:>10} {s:>6} ", .{ "pattern", "elements", "path" });
     var i: usize = 0;
     while (i < prev_cols) : (i += 1) {
@@ -475,15 +569,21 @@ fn printTable(rows: []const Row, hists: []const HistEntry) void {
     }
 }
 
+/// Merges current timings into history and persists the capped file.
+/// - `io` - file-system context for writing.
+/// - `alloc` - owns the serialized buffer.
+/// - `rows` - current benchmark results.
+/// - `hists` - prior timings to preserve.
+///
+/// Return - error on allocation or write failure.
 fn saveHistory(io: std.Io, alloc: Allocator, rows: []const Row, hists: []const HistEntry) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
-    try buf.print(alloc, "# bench_ntree history v2: <name> <ms/rep oldest-first, up to {d}>\n", .{MAX_PREV_COLS});
+    try buf.print(alloc, "# bench_bit_tree history v2: <name> <ms/rep oldest-first, up to {d}>\n", .{MAX_PREV_COLS});
     for (rows) |row| {
         try buf.print(alloc, "{s}", .{row.name});
         if (findHist(hists, row.name)) |idx| {
             const old = hists[idx].vals.items;
-            // old ++ [cur], храним последние MAX_PREV_COLS.
             const keep_from: usize = if (old.len + 1 > MAX_PREV_COLS) old.len + 1 - MAX_PREV_COLS else 0;
             for (old[keep_from..]) |v| {
                 try buf.print(alloc, " {d:.6}", .{v});
@@ -491,7 +591,6 @@ fn saveHistory(io: std.Io, alloc: Allocator, rows: []const Row, hists: []const H
         }
         try buf.print(alloc, " {d:.6}\n", .{row.ms});
     }
-    // Строки из истории, которых не было в текущем прогоне, не теряем.
     for (hists) |h| {
         var seen = false;
         for (rows) |row| {
@@ -510,6 +609,10 @@ fn saveHistory(io: std.Io, alloc: Allocator, rows: []const Row, hists: []const H
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = HISTORY_PATH, .data = buf.items });
 }
 
+/// Builds shared scenarios, runs all benchmarks and updates history.
+/// - `init` - process context providing I/O and arguments.
+///
+/// Return - error on allocation, verification or I/O failure.
 pub fn main(init: std.process.Init) !void {
     const io: std.Io = init.io;
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -541,31 +644,30 @@ pub fn main(init: std.process.Init) !void {
     try ultra.resize(alloc, 10_000_000, .inactive);
     fillStride(&ultra, 100_003, 7);
 
-    var sparse_ntree = NewTree{};
-    defer sparse_ntree.deinit(alloc);
-    try sparse_ntree.resize(alloc, 1_000_000, .inactive);
-    fillNewStride(&sparse_ntree, 997, 1);
+    var sparse_tree = Tree{};
+    defer sparse_tree.deinit(alloc);
+    try sparse_tree.resize(alloc, 1_000_000, .inactive);
+    fillTreeStride(&sparse_tree, 997, 1);
 
-    var dense_ntree = NewTree{};
-    defer dense_ntree.deinit(alloc);
-    try dense_ntree.resize(alloc, 100_000, .active);
+    var dense_tree = Tree{};
+    defer dense_tree.deinit(alloc);
+    try dense_tree.resize(alloc, 100_000, .active);
 
-    var strided_ntree = NewTree{};
-    defer strided_ntree.deinit(alloc);
-    try strided_ntree.resize(alloc, 200_000, .inactive);
-    fillNewStride(&strided_ntree, 3, 0);
+    var strided_tree = Tree{};
+    defer strided_tree.deinit(alloc);
+    try strided_tree.resize(alloc, 200_000, .inactive);
+    fillTreeStride(&strided_tree, 3, 0);
 
-    var ultra_ntree = NewTree{};
-    defer ultra_ntree.deinit(alloc);
-    try ultra_ntree.resize(alloc, 10_000_000, .inactive);
-    fillNewStride(&ultra_ntree, 100_003, 7);
+    var ultra_tree = Tree{};
+    defer ultra_tree.deinit(alloc);
+    try ultra_tree.resize(alloc, 10_000_000, .inactive);
+    fillTreeStride(&ultra_tree, 100_003, 7);
 
-    // Те же сценарии и reps, что раньше (без arith).
-    try benchOne(io, alloc, &rows, "sparse1M", &sparse, &sparse_ntree, .active, 500);
-    try benchOne(io, alloc, &rows, "sparse1M-inactive", &sparse, &sparse_ntree, .inactive, 5);
-    try benchOne(io, alloc, &rows, "dense100k", &dense, &dense_ntree, .active, 20);
-    try benchOne(io, alloc, &rows, "every3rd200k", &strided, &strided_ntree, .active, 20);
-    try benchOne(io, alloc, &rows, "ultra10M", &ultra, &ultra_ntree, .active, 200);
+    try benchOne(io, alloc, &rows, "sparse1M", &sparse, &sparse_tree, .active, 500);
+    try benchOne(io, alloc, &rows, "sparse1M-inactive", &sparse, &sparse_tree, .inactive, 5);
+    try benchOne(io, alloc, &rows, "dense100k", &dense, &dense_tree, .active, 20);
+    try benchOne(io, alloc, &rows, "every3rd200k", &strided, &strided_tree, .active, 20);
+    try benchOne(io, alloc, &rows, "ultra10M", &ultra, &ultra_tree, .active, 200);
 
     const strides = [_]u32{ 1, 2, 4, 8, 16, 64, 256, 1024, 4096, 16384, 65536 };
     for ([_]u32{1_000_000}) |total| {

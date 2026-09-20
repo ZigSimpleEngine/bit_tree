@@ -10,34 +10,44 @@ const ListA64 = utilities.ListA64;
 const BitState = utilities.BitState;
 const WordType = bit_word.WordType;
 
-pub const PredictForce = enum { auto, flat, tree };
+/// Forces the iteration path instead of auto prediction.
+pub const PredictForce = enum {
+    /// Chooses flat or tree automatically from density.
+    auto,
+    /// Always scans the flat bitset directly.
+    flat,
+    /// Always descends the summary pyramid.
+    tree,
+};
 
+/// Thresholds and costs that tune the flat versus tree choice.
 pub const PredictConfig = struct {
+    /// Hit density above which active-only scans prefer flat.
     t_active: f32 = 0.01,
+    /// Hit density above which inactive-only scans prefer flat.
     t_inactive: f32 = 0.9,
+    /// Short-circuits to flat when upper levels lack mixed states.
     use_uniformity: bool = true,
+    /// Enables the linear cost model after density checks.
     use_cost: bool = false,
+    /// Per-word cost of the flat scan in the cost model.
     c0: f32 = 1.0,
+    /// Per-hit cost of the flat path in the cost model.
     c1f: f32 = 1.0,
+    /// Per-top-word cost of the tree descent.
     c2: f32 = 8.0,
+    /// Per-descent cost through mixed states.
     c3: f32 = 12.0,
+    /// Per-hit cost of the tree path in the cost model.
     c1t: f32 = 1.4,
+    /// Manual override applied before density checks.
     force: PredictForce = .auto,
 };
 
+/// Global overrides checked after per-width rows.
 pub var predict_config: PredictConfig = .{};
 
-/// Calibrated `PredictConfig` row per word type (index by `@intFromEnum(WordType)`:
-/// u8=0, u16=1, u32=2, u64=3). Auto mode reads its row, so each width runs
-/// its own best coefficients. Tune programmatically via `predict_table` / `predict_config`.
-///
-/// Calibration (ReleaseFast, N=262144 + bench N=1M/10M, active+inactive):
-/// - active: gap64 (hd=0.0156) flat wins / ties; gap256 (hd=0.0039) flat wins
-///   1.6x on bench; gap1024 (hd=0.001) tree wins 3-8x; sparse tree wins 10-80x.
-///   => t_active=0.002 splits the (0.001, 0.0039) crossover on all widths.
-/// - inactive: u8 tree wins at hd>=0.984 (bulk for-loop beats ctz-peeling),
-///   flat at hd<=0.875 => t=0.93; u16/u32 hairs split around gap8/gap2 => 0.7;
-///   u64 all within ~1% noise => 0.9 (keeps near-full bulk on the tree path).
+/// Calibrated per-width rows indexed by word type for auto mode.
 pub var predict_table: [4]PredictConfig = .{
     .{ .t_active = 0.002, .t_inactive = 0.93 },
     .{ .t_active = 0.002, .t_inactive = 0.7 },
@@ -45,55 +55,77 @@ pub var predict_table: [4]PredictConfig = .{
     .{ .t_active = 0.002, .t_inactive = 0.9 },
 };
 
+/// Selects the calibration row for one word width.
+/// - `wt` - word width whose row is needed.
+///
+/// Return - mutable pointer to the width-specific config.
 fn predictRow(wt: WordType) *PredictConfig {
     return &predict_table[@intFromEnum(wt)];
 }
 
+/// Records the last auto choice for benchmarks and tests.
 pub var last_predict_used_flat: bool = false;
 
+/// Hierarchical bitset with pyramid summaries and adaptive iteration.
+/// - `wt` - word width for backing storage.
+///
+/// Return - tree type with flat and tree iteration arms.
 pub fn BitTree(comptime wt: WordType) type {
     const Word = wt.Type();
     const bw = bit_word.BitWord(wt);
 
     return struct {
         const Self = @This();
-        const L = Layer(wt);
-        const B = BitSet(wt);
 
+        /// Flat leaf storage holding every valid bit.
         bitset: BitSet(wt) = .{},
+        /// Summary pyramid where level zero mirrors the bitset.
         layers: ListA64(L) = .empty,
 
+        /// Bundles a tree pointer with caller context for iteration.
+        /// - `Context` - caller-provided iteration context.
+        ///
+        /// Return - pairing struct passed to every iterate call.
         pub fn TreeWithContext(Context: type) type {
             return struct {
+                /// Tree being scanned, provides leaves and pyramid.
                 tree: *Self,
+                /// Caller context forwarded to per-bit callbacks.
                 context: Context,
             };
         }
 
+        /// Builds an adaptive visitor that picks flat or tree traversal.
+        /// - `Context` - caller-provided iteration context.
+        /// - `on_active` - visitor for set bits, null skips them.
+        /// - `on_inactive` - visitor for cleared bits, null skips them.
+        ///
+        /// Return - iterator type with flat and tree arms.
         pub fn Iterator(
             comptime Context: type,
             comptime on_active: InlineIteratorCallback(Context),
             comptime on_inactive: InlineIteratorCallback(Context),
         ) type {
             return struct {
-                const inactive_unwrapper = ActivityUnwrapper(on_inactive).unwrap;
-                const active_unwrapper = ActivityUnwrapper(on_active).unwrap;
-
-                const LI = L.Iterator(
-                    *LayerWithContext,
-                    if (on_inactive != null) inactive_unwrapper else null,
-                    if (on_active != null) active_unwrapper else null,
-                    mixed_unwrapper,
-                    deep_mixed_unwrapper,
-                );
-
+                /// Level cursor pairing a tree with the current depth.
                 const LayerWithContext = TreeWithContext(struct {
+                    /// Current pyramid depth, decremented on descent.
                     layer_id: u32,
+                    /// Caller context forwarded to per-bit callbacks.
                     context: Context,
                 });
 
+                /// Adapts a bit callback into a layer visitor over one word span.
+                /// - `callback` - per-bit visitor to invoke for the span.
+                ///
+                /// Return - wrapper type exposing the unwrap entry point.
                 fn ActivityUnwrapper(comptime callback: InlineIteratorCallback(Context)) type {
                     return struct {
+                        /// Expands one summary word into per-bit visits honoring bounds.
+                        /// - `data` - tree and depth cursor.
+                        /// - `word_id` - summary word index to expand.
+                        ///
+                        /// Return - false on early exit, true when the span completed.
                         inline fn unwrap(data: *LayerWithContext, word_id: u32) bool {
                             const layer_id = data.context.layer_id;
                             const context = data.context.context;
@@ -116,37 +148,25 @@ pub fn BitTree(comptime wt: WordType) type {
                     };
                 }
 
-                fn mixed_unwrapper(data: *LayerWithContext, word_id: u32) bool {
-                    data.context.layer_id -= 1;
-                    const lower = &data.tree.layers.items[data.context.layer_id];
-                    const ok = LI.step(.{ .layer = lower, .context = data }, word_id);
-                    data.context.layer_id += 1;
-                    if (!ok) return false;
-                    return true;
-                }
+                /// Adapted visitor that expands inactive summary words.
+                const inactive_unwrapper = ActivityUnwrapper(on_inactive).unwrap;
 
-                inline fn deep_mixed_unwrapper(data: *LayerWithContext, word_id: u32) bool {
-                    const layer_id = data.context.layer_id;
-                    const end_word_id = word_id + 1;
-                    const shift: u32 = bw.shift_type_bits * (layer_id - 1);
-                    const s5: u5 = @truncate(shift);
-                    const start_bit_id = word_id << s5;
-                    var end_bit_id = end_word_id << s5;
-                    const words_len: u32 = @truncate(data.tree.bitset.words.items.len);
-                    if (end_bit_id > words_len) end_bit_id = words_len;
-                    if (start_bit_id >= words_len) return true;
+                /// Adapted visitor that expands active summary words.
+                const active_unwrapper = ActivityUnwrapper(on_active).unwrap;
 
-                    const BI = B.Iterator(Context, on_active, on_inactive);
-                    const bi_data: B.BitsetWithContext(Context) = .{
-                        .bitset = &data.tree.bitset,
-                        .context = data.context.context,
-                    };
-                    for (start_bit_id..end_bit_id) |i| {
-                        if (!BI.step(bi_data, @truncate(i))) return false;
-                    }
-                    return true;
-                }
+                /// Layer visitor that drives pyramid descent for both states.
+                const LI = L.Iterator(
+                    *LayerWithContext,
+                    if (on_inactive != null) inactive_unwrapper else null,
+                    if (on_active != null) active_unwrapper else null,
+                    mixed_unwrapper,
+                    deep_mixed_unwrapper,
+                );
 
+                /// Runs the predicted path and records the choice for inspection.
+                /// - `data` - tree and caller context.
+                ///
+                /// Return - false on early exit, true when the scan completed.
                 pub fn iterateAll(data: TreeWithContext(Context)) bool {
                     const use_flat = predictsFlat(data.tree);
                     last_predict_used_flat = use_flat;
@@ -154,6 +174,10 @@ pub fn BitTree(comptime wt: WordType) type {
                     return iterateTree(data);
                 }
 
+                /// Predicts whether a flat scan beats pyramid descent.
+                /// - `tree` - tree whose density and uniformity are scored.
+                ///
+                /// Return - true for flat, false for tree.
                 pub fn predictsFlat(tree: *const Self) bool {
                     const cfg = predictRow(wt);
                     switch (cfg.force) {
@@ -203,11 +227,19 @@ pub fn BitTree(comptime wt: WordType) type {
                     return false;
                 }
 
+                /// Scans leaves directly without touching summaries.
+                /// - `data` - tree and caller context.
+                ///
+                /// Return - false on early exit, true when the scan completed.
                 pub fn iterateFlat(data: TreeWithContext(Context)) bool {
                     const BI = B.Iterator(Context, on_active, on_inactive);
                     return BI.iterateAll(.{ .bitset = &data.tree.bitset, .context = data.context });
                 }
 
+                /// Walks the pyramid from the top word down to leaves.
+                /// - `data` - tree and caller context.
+                ///
+                /// Return - false on early exit, true when the walk completed.
                 pub inline fn iterateTree(data: TreeWithContext(Context)) bool {
                     const layers = data.tree.layers.items;
                     if (layers.len == 0) return true;
@@ -229,9 +261,58 @@ pub fn BitTree(comptime wt: WordType) type {
 
                     return true;
                 }
+
+                /// Descends one level through a mixed summary word.
+                /// - `data` - tree and depth cursor.
+                /// - `word_id` - mixed word index to descend.
+                ///
+                /// Return - false on early exit, true when the descent completed.
+                fn mixed_unwrapper(data: *LayerWithContext, word_id: u32) bool {
+                    data.context.layer_id -= 1;
+                    const lower = &data.tree.layers.items[data.context.layer_id];
+                    const ok = LI.step(.{ .layer = lower, .context = data }, word_id);
+                    data.context.layer_id += 1;
+                    if (!ok) return false;
+                    return true;
+                }
+
+                /// Scans leaf words covered by a deeply mixed summary word.
+                /// - `data` - tree and depth cursor.
+                /// - `word_id` - deep-mixed word index to scan.
+                ///
+                /// Return - false on early exit, true when the scan completed.
+                inline fn deep_mixed_unwrapper(data: *LayerWithContext, word_id: u32) bool {
+                    const layer_id = data.context.layer_id;
+                    const end_word_id = word_id + 1;
+                    const shift: u32 = bw.shift_type_bits * (layer_id - 1);
+                    const s5: u5 = @truncate(shift);
+                    const start_bit_id = word_id << s5;
+                    var end_bit_id = end_word_id << s5;
+                    const words_len: u32 = @truncate(data.tree.bitset.words.items.len);
+                    if (end_bit_id > words_len) end_bit_id = words_len;
+                    if (start_bit_id >= words_len) return true;
+
+                    const BI = B.Iterator(Context, on_active, on_inactive);
+                    const bi_data: B.BitsetWithContext(Context) = .{
+                        .bitset = &data.tree.bitset,
+                        .context = data.context.context,
+                    };
+                    for (start_bit_id..end_bit_id) |i| {
+                        if (!BI.step(bi_data, @truncate(i))) return false;
+                    }
+                    return true;
+                }
             };
         }
 
+        /// Level type alias that shortens pyramid declarations.
+        const L = Layer(wt);
+        /// Leaf type alias that shortens flat-path declarations.
+        const B = BitSet(wt);
+
+        /// Releases leaves and every pyramid level.
+        /// - `self` - tree to destroy.
+        /// - `allocator` - allocator that owns all planes.
         pub fn deinit(self: *Self, allocator: Allocator) void {
             self.bitset.deinit(allocator);
             for (self.layers.items) |*layer| {
@@ -240,6 +321,11 @@ pub fn BitTree(comptime wt: WordType) type {
             self.layers.deinit(allocator);
         }
 
+        /// Writes masked lanes into leaves and refreshes summaries upward.
+        /// - `self` - tree to update.
+        /// - `id` - leaf word index to patch.
+        /// - `word` - new lanes to install.
+        /// - `mask` - selects lanes to overwrite, padding is ignored.
         pub fn setWord(self: *Self, id: u32, word: Word, mask: Word) void {
             self.bitset.setWord(id, word, mask);
             self.layers.items[0].setWord(id, word, 0, mask);
@@ -251,6 +337,10 @@ pub fn BitTree(comptime wt: WordType) type {
             }
         }
 
+        /// Writes one bit and refreshes summaries along its pyramid path.
+        /// - `self` - tree to update.
+        /// - `id` - global bit position to write.
+        /// - `value` - state to store.
         pub fn setBit(self: *Self, id: u32, value: BitState) void {
             self.bitset.setBit(id, value);
             const leaf: Layer(wt).State = if (value == .active) .active else .inactive;
@@ -263,6 +353,13 @@ pub fn BitTree(comptime wt: WordType) type {
             }
         }
 
+        /// Grows or shrinks leaves and pyramid while keeping summaries exact.
+        /// - `self` - tree to resize.
+        /// - `allocator` - owns backing storage.
+        /// - `new_bits_count` - target valid bits.
+        /// - `created_bits_value` - state filling newly created bits.
+        ///
+        /// Return - error on allocation failure.
         pub fn resize(self: *Self, allocator: Allocator, new_bits_count: u32, created_bits_value: BitState) !void {
             try self.bitset.resize(allocator, new_bits_count, created_bits_value);
 
@@ -300,6 +397,10 @@ pub fn BitTree(comptime wt: WordType) type {
             }
         }
 
+        /// Recomputes one summary position from its lower word.
+        /// - `self` - tree holding the pyramid.
+        /// - `upper_layer` - level index to refresh.
+        /// - `word_id` - word position inside the upper level.
         fn refreshWord(self: *Self, upper_layer: usize, word_id: u32) void {
             const lower = &self.layers.items[upper_layer - 1];
             const upper = &self.layers.items[upper_layer];
@@ -358,14 +459,11 @@ inline fn treePushI(ctx: *TreeStepIds, bit_id: u32) bool {
     return ctx.total() < ctx.stop_after;
 }
 
-/// Сбор id через итератор. Код возврата step не проверяем: это деталь
-/// реализации; полноту результата сверяем с оракулом (id и суммы).
 fn treeStepCollectAll(comptime wt: WordType, tree: *BitTree(wt), ctx: *TreeStepIds) void {
     const It = BitTree(wt).Iterator(*TreeStepIds, treePushA, treePushI);
     _ = It.iterateAll(.{ .tree = tree, .context = ctx });
 }
 
-/// Независимый эталон: побитовое чтение битсета 0..bits_count-1.
 fn treeOracleIds(comptime wt: WordType, tree: *const BitTree(wt), target: BitState, out: *[512]u32) usize {
     const BW = bit_word.BitWord(wt);
     var n: usize = 0;
@@ -380,9 +478,6 @@ fn treeOracleIds(comptime wt: WordType, tree: *const BitTree(wt), target: BitSta
     return n;
 }
 
-/// Независимая сверка summary сверху вниз, бит за битом (не popcount):
-/// слой 1 — 0/все/иначе в inactive/active/deep_mixed; выше — единогласие
-/// детей в их стейт, иначе mixed.
 fn expectSummariesValid(comptime wt: WordType, tree: *const BitTree(wt)) !void {
     const Word = wt.Type();
     const BW = bit_word.BitWord(wt);
@@ -421,7 +516,6 @@ fn expectSummariesValid(comptime wt: WordType, tree: *const BitTree(wt)) !void {
                         uniform = false;
                     }
                 }
-                // У хранимого слова всегда есть >= 1 валидный бит.
                 want = if (uniform) first else .mixed;
             }
             const uwid = BW.bitToWordId(j);
@@ -445,7 +539,6 @@ fn treeLayerState(comptime wt: WordType, tree: *const BitTree(wt), li: usize, j:
 }
 
 test "BitTree summary rule: unanimity + layer1 deep" {
-    // Слово 0: все inactive; слово 1: все active.
     {
         var tree = BitTree(.u64){};
         defer tree.deinit(t.allocator);
@@ -454,7 +547,6 @@ test "BitTree summary rule: unanimity + layer1 deep" {
         try t.expectEqual(Layer(.u64).State.inactive, treeLayerState(.u64, &tree, 1, 0));
         try t.expectEqual(Layer(.u64).State.active, treeLayerState(.u64, &tree, 1, 1));
     }
-    // [half/half] на слое 1 -> deep_mixed (никогда mixed).
     {
         var tree = BitTree(.u64){};
         defer tree.deinit(t.allocator);
@@ -463,15 +555,10 @@ test "BitTree summary rule: unanimity + layer1 deep" {
         try t.expectEqual(Layer(.u64).State.deep_mixed, treeLayerState(.u64, &tree, 1, 0));
         try t.expectEqual(Layer(.u64).State.inactive, treeLayerState(.u64, &tree, 1, 1));
     }
-    // Слой 2 над [active, inactive] детьми -> mixed (не deep).
-    // Слой 2 над all-deep детьми -> deep_mixed.
     {
         var tree = BitTree(.u64){};
         defer tree.deinit(t.allocator);
         try tree.resize(t.allocator, 8192, .inactive);
-        // Нижние слова 0..31 active, остальные inactive: биты слоя 1
-        // 0..31 active, 40.. inactive. Слово 0 слоя 1 смешанное
-        // (active+inactive) -> бит 0 слоя 2 mixed.
         var wid: u32 = 0;
         while (wid < 32) : (wid += 1) {
             tree.setWord(wid, std.math.maxInt(u64), std.math.maxInt(u64));
@@ -480,8 +567,6 @@ test "BitTree summary rule: unanimity + layer1 deep" {
         try t.expectEqual(Layer(.u64).State.inactive, treeLayerState(.u64, &tree, 1, 40));
         try t.expectEqual(Layer(.u64).State.mixed, treeLayerState(.u64, &tree, 2, 0));
         try t.expectEqual(Layer(.u64).State.inactive, treeLayerState(.u64, &tree, 2, 1));
-        // Каждое слово 0..63 неоднородно (ровно 1 бит) -> биты 0..63 слоя 1
-        // deep, слово 0 слоя 1 единогласно deep -> бит 0 слоя 2 deep_mixed.
         var tree2 = BitTree(.u64){};
         defer tree2.deinit(t.allocator);
         try tree2.resize(t.allocator, 8192, .inactive);
@@ -496,8 +581,6 @@ test "BitTree summary rule: unanimity + layer1 deep" {
     }
 }
 
-/// Когерентность: плоскость activity слоя 0 == слова битсета, mixed листа
-/// нулевой, счётчики == независимому скану, summary валидны.
 fn expectTreeCoherent(comptime wt: WordType, tree: *const BitTree(wt)) !void {
     const Word = wt.Type();
     const BW = bit_word.BitWord(wt);
@@ -510,7 +593,6 @@ fn expectTreeCoherent(comptime wt: WordType, tree: *const BitTree(wt)) !void {
         return;
     }
     try t.expectEqual(words.len, tree.layers.items[0].activity.items.len);
-    // Слой 0 зеркалит битсет (в валидных битах), mixed нулевой.
     var wid: usize = 0;
     while (wid < words.len) : (wid += 1) {
         const used = BW.bitIdInWord(n);
@@ -518,7 +600,6 @@ fn expectTreeCoherent(comptime wt: WordType, tree: *const BitTree(wt)) !void {
         try t.expectEqual(words[wid] & valid, tree.layers.items[0].activity.items[wid] & valid);
         try t.expectEqual(@as(Word, 0), tree.layers.items[0].mixed.items[wid] & valid);
     }
-    // Счётчики каждого слоя == независимому скану.
     var k: usize = 0;
     while (k < tree.layers.items.len) : (k += 1) {
         const layer = &tree.layers.items[k];
@@ -533,7 +614,6 @@ fn expectTreeCoherent(comptime wt: WordType, tree: *const BitTree(wt)) !void {
         }
         try t.expectEqualSlices(u32, &scanned, &layer.state_counters);
     }
-    // Лист: active == счётчик битсета, mixed/deep пустые.
     try t.expectEqual(tree.bitset.active_bits_counter, tree.layers.items[0].state_counters[L.State.active_u32]);
     try t.expectEqual(@as(u32, 0), tree.layers.items[0].state_counters[L.State.mixed_u32]);
     try t.expectEqual(@as(u32, 0), tree.layers.items[0].state_counters[L.State.deep_mixed_u32]);
@@ -554,7 +634,6 @@ fn treeStepCheckOne(comptime wt: WordType, n: u32, active_every: u32, active_off
     }
     try expectTreeCoherent(wt, &tree);
 
-    // Порча паддинга битсета напрямую: step идёт через битсет и маску.
     if (n > 0) {
         const used = BW.bitIdInWord(n);
         const valid: Word = if (used == 0) std.math.maxInt(Word) else BW.maskStart(used);
@@ -586,10 +665,6 @@ test "BitTree step: counts vs oracle + corners" {
 }
 
 test "BitTree step: early exit" {
-    // Проверяем только результат: сколько колбэков случилось, все id
-    // валидны, без дублей и с правильным состоянием. Порядок обхода и
-    // код возврата step — детали реализации, их не проверяем.
-    // Остановка в bulk-проходе первого однородного региона.
     {
         var tree = BitTree(.u64){};
         defer tree.deinit(t.allocator);
@@ -610,9 +685,6 @@ test "BitTree step: early exit" {
             seen[id] = true;
         }
     }
-    // Остановка во втором регионе (смешанное дерево).
-    // Порядок обхода не гарантируется: проверяем только факт ранней
-    // остановки, общее число вызовов и корректность самих id.
     {
         var tree = BitTree(.u64){};
         defer tree.deinit(t.allocator);
@@ -622,7 +694,6 @@ test "BitTree step: early exit" {
         var ctx = TreeStepIds{ .stop_after = 65 };
         _ = It.iterateAll(.{ .tree = &tree, .context = &ctx });
         try t.expectEqual(@as(usize, 65), ctx.na + ctx.ni);
-        // Все отданные id валидны, без дублей и с правильным состоянием.
         var seen: [130]bool = [_]bool{false} ** 130;
         for (ctx.active[0..ctx.na]) |id| {
             try t.expect(id < 130);
@@ -637,7 +708,6 @@ test "BitTree step: early exit" {
             try t.expect(id != 100);
         }
     }
-    // stop_after = 1: ровно один вызов и остановка.
     {
         var tree = BitTree(.u64){};
         defer tree.deinit(t.allocator);
@@ -646,15 +716,12 @@ test "BitTree step: early exit" {
         var ctx = TreeStepIds{ .stop_after = 1 };
         _ = It2.iterateAll(.{ .tree = &tree, .context = &ctx });
         try t.expectEqual(@as(usize, 1), ctx.ni + ctx.na);
-        // Единственный отданный id валиден.
         const only = if (ctx.na == 1) ctx.active[0] else ctx.inactive[0];
         try t.expect(only < 10);
     }
 }
 
 test "BitTree step: null side skips opposite uniform regions" {
-    // Только active: однородно-inactive регионы не дают вызовов,
-    // бит 100 находится через спуск.
     {
         var tree = BitTree(.u64){};
         defer tree.deinit(t.allocator);
@@ -666,8 +733,6 @@ test "BitTree step: null side skips opposite uniform regions" {
         try t.expectEqualSlices(u32, &[_]u32{100}, ctx.active[0..ctx.na]);
         try t.expectEqual(@as(usize, 0), ctx.ni);
     }
-    // Только inactive: бит 100 (active) не виден, остальные 129 на месте.
-    // Порядок не гарантируется: сортируем копию перед сверкой границ.
     {
         var tree = BitTree(.u64){};
         defer tree.deinit(t.allocator);
@@ -685,7 +750,6 @@ test "BitTree step: null side skips opposite uniform regions" {
 }
 
 test "BitTree pyramid shape + coherence under ops" {
-    // Форма пирамиды: [70] -> [70, 2, 1]; [64] -> [64, 1]; [1] -> [1]; [0] -> [].
     {
         var tree = BitTree(.u64){};
         defer tree.deinit(t.allocator);
@@ -711,7 +775,6 @@ test "BitTree pyramid shape + coherence under ops" {
         try t.expectEqual(@as(usize, 0), tree.layers.items.len);
         try t.expectEqual(@as(usize, 0), tree.bitset.words.items.len);
     }
-    // Смесь операций: флипы на границах слов + setWord с частичной маской.
     {
         var tree = BitTree(.u8){};
         defer tree.deinit(t.allocator);
@@ -729,9 +792,6 @@ test "BitTree pyramid shape + coherence under ops" {
         try t.expectEqual(tree.bitset.active_bits_counter, @as(u32, @intCast(ctx.na)));
     }
 }
-
-// ================= Глубокие пирамиды, прочие ширины, многоуровневый shrink =================
-// Totals-харнес без хранения id (для размеров больше буфера [512]).
 
 const StepTotals = struct {
     na: usize = 0,
@@ -755,7 +815,6 @@ fn treeStepTotals(comptime wt: WordType, tree: *BitTree(wt), ctx: *StepTotals) v
     _ = It.iterateAll(.{ .tree = tree, .context = ctx });
 }
 
-/// Эталонные итоги побитовым сканом битсета (без хранения).
 fn treeOracleTotals(comptime wt: WordType, tree: *const BitTree(wt)) [2]u64 {
     const BW = bit_word.BitWord(wt);
     var out = [2]u64{ 0, 0 };
@@ -781,7 +840,6 @@ fn treeExpectTotals(comptime wt: WordType, tree: *BitTree(wt)) !void {
 }
 
 test "BitTree deep pyramid 4+ levels" {
-    // u64 20000 бит: слои [20000, 313, 5, 1], разреженный паттерн.
     {
         var tree = BitTree(.u64){};
         defer tree.deinit(t.allocator);
@@ -798,7 +856,6 @@ test "BitTree deep pyramid 4+ levels" {
         try expectTreeCoherent(.u64, &tree);
         try treeExpectTotals(.u64, &tree);
     }
-    // u64 20000 плотный: все active, каждый 3-й сброшен.
     {
         var tree = BitTree(.u64){};
         defer tree.deinit(t.allocator);
@@ -811,7 +868,6 @@ test "BitTree deep pyramid 4+ levels" {
         try treeExpectTotals(.u64, &tree);
         try t.expectEqual(@as(u32, 20000 - 6667), tree.bitset.active_bits_counter);
     }
-    // u64 100000 бит: слои [100000, 1563, 25, 1], глубина 4+.
     {
         var tree = BitTree(.u64){};
         defer tree.deinit(t.allocator);
@@ -841,7 +897,6 @@ test "BitTree u16/u32 spot checks" {
             try treeStepCheckOne(.u32, n, m, 1);
         }
     }
-    // Когерентность u16/u32 после смеси операций.
     {
         var tree = BitTree(.u16){};
         defer tree.deinit(t.allocator);
@@ -869,12 +924,10 @@ test "BitTree u16/u32 spot checks" {
 test "BitTree multi-level shrink/grow" {
     var tree = BitTree(.u64){};
     defer tree.deinit(t.allocator);
-    // 20000 active: глубина 4.
     try tree.resize(t.allocator, 20000, .active);
     try t.expectEqual(@as(usize, 4), tree.layers.items.len);
     try t.expectEqual(@as(u32, 20000), tree.bitset.active_bits_counter);
     try expectTreeCoherent(.u64, &tree);
-    // Shrink 20000 -> 10 одним вызовом: глубина 4 -> 2, первые 10 active.
     try tree.resize(t.allocator, 10, .inactive);
     try t.expectEqual(@as(usize, 2), tree.layers.items.len);
     try t.expectEqual(@as(u32, 10), tree.layers.items[0].bits_count);
@@ -882,7 +935,6 @@ test "BitTree multi-level shrink/grow" {
     try t.expectEqual(@as(u32, 10), tree.bitset.active_bits_counter);
     try expectTreeCoherent(.u64, &tree);
     try treeExpectTotals(.u64, &tree);
-    // Grow 10 -> 5000 одним вызовом: глубина 2 -> 4.
     try tree.resize(t.allocator, 5000, .active);
     try t.expectEqual(@as(usize, 4), tree.layers.items.len);
     try t.expectEqual(@as(u32, 5000), tree.layers.items[0].bits_count);
@@ -892,7 +944,6 @@ test "BitTree multi-level shrink/grow" {
     try t.expectEqual(@as(u32, 5000), tree.bitset.active_bits_counter);
     try expectTreeCoherent(.u64, &tree);
     try treeExpectTotals(.u64, &tree);
-    // Shrink в 0 и regrow: слои исчезают и создаются заново.
     try tree.resize(t.allocator, 0, .inactive);
     try t.expectEqual(@as(usize, 0), tree.layers.items.len);
     try t.expectEqual(@as(usize, 0), tree.bitset.words.items.len);
@@ -902,9 +953,6 @@ test "BitTree multi-level shrink/grow" {
     try treeExpectTotals(.u64, &tree);
 }
 
-// ================= Debug: iteration order =================
-// Unified visitation log: both callbacks append to the same array,
-// so `ids[0..n]` reflects the real callback invocation order.
 const OrderDebugIds = struct {
     ids: [512]u32 = undefined,
     n: usize = 0,
@@ -953,7 +1001,6 @@ fn orderDebugCheckOne(comptime wt: WordType, n: u32, active_every: u32, active_o
     const It = BitTree(wt).Iterator(*OrderDebugIds, orderDebugPushA, orderDebugPushI);
     _ = It.iterateAll(.{ .tree = &tree, .context = &ctx });
 
-    // Pure debug info: never fail the test on order, only report.
     if (orderDebugIsSorted(&ctx)) {
         std.debug.print("BitTree iteration order: OK (n={d} every={d} offset={d} total={d})\n", .{ n, active_every, active_offset, ctx.n });
     } else {
@@ -963,7 +1010,6 @@ fn orderDebugCheckOne(comptime wt: WordType, n: u32, active_every: u32, active_o
 }
 
 test "BitTree step: debug iteration order" {
-    // Debug only: prints OK/VIOLATED per case, never fails on order.
     const sizes = [_]u32{ 0, 1, 10, 64, 65, 70, 128, 130, 200, 300 };
     const mods = [_]u32{ 0, 1, 2, 3, 7 };
     for (sizes) |n| {
@@ -1027,7 +1073,6 @@ test "BitTree predict: auto/flat/tree parity vs oracle" {
             try predictParityCheckOne(.u64, n, m, 0);
         }
     }
-    // Empty-result fast path must not crash in any mode.
     for ([_]PredictForce{ .auto, .flat, .tree }) |m| {
         predict_config.force = m;
         var tree = BitTree(.u64){};
@@ -1040,8 +1085,6 @@ test "BitTree predict: auto/flat/tree parity vs oracle" {
     }
 }
 
-/// Hoisted bench pattern: predictsFlat once, then the chosen arm directly.
-/// Same result contract as iterateAll (this is what timed bench loops use).
 fn treeHoistedCollectAll(comptime wt: WordType, tree: *BitTree(wt), ctx: *TreeStepIds) void {
     const It = BitTree(wt).Iterator(*TreeStepIds, treePushA, treePushI);
     if (It.predictsFlat(tree)) {
