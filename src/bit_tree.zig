@@ -1001,11 +1001,10 @@ fn orderDebugCheckOne(comptime wt: WordType, n: u32, active_every: u32, active_o
     const It = BitTree(wt).Iterator(*OrderDebugIds, orderDebugPushA, orderDebugPushI);
     _ = It.iterateAll(.{ .tree = &tree, .context = &ctx });
 
-    if (orderDebugIsSorted(&ctx)) {
-        std.debug.print("BitTree iteration order: OK (n={d} every={d} offset={d} total={d})\n", .{ n, active_every, active_offset, ctx.n });
-    } else {
+    if (!orderDebugIsSorted(&ctx)) {
         const v = orderDebugFirstViolation(&ctx);
         std.debug.print("BitTree iteration order: VIOLATED (n={d} every={d} offset={d} total={d} first_violation_at={d} prev={d} cur={d})\n", .{ n, active_every, active_offset, ctx.n, v[0], v[1], v[2] });
+        return error.OrderViolated;
     }
 }
 
@@ -1257,5 +1256,4 @@ test "BitTree CommonIterator cross: summary layer vs bitset 262144" {
     }
     try t.expectEqual(bctx.active.items.len, lock.ca);
     try t.expectEqual(bctx.inactive.items.len, lock.ci);
-    std.debug.print("cross 262144: active={} inactive={}\n", .{ bctx.active.items.len, bctx.inactive.items.len });
 }
