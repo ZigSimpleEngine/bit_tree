@@ -95,6 +95,21 @@ pub fn BitTree(comptime wt: WordType) type {
             };
         }
 
+        /// Bundles tree pointers with caller context for common iteration.
+        /// - `Context` - caller-provided iteration context.
+        ///
+        /// Return - pairing struct passed to every iterate call.
+        pub fn TreesWithContext(comptime include_len: u32, comptime exclude_len: u32, Context: type) type {
+            return struct {
+                /// Trees whose leaves are ANDed, provide shared bounds.
+                includes: [include_len]*Self,
+                /// Trees whose leaves are ORed, provide exclusion lanes.
+                excludes: [exclude_len]*Self,
+                /// Caller context forwarded to per-bit callbacks.
+                context: Context,
+            };
+        }
+
         /// Builds an adaptive visitor that picks flat or tree traversal.
         /// - `Context` - caller-provided iteration context.
         /// - `on_active` - visitor for set bits, null skips them.
@@ -295,6 +310,403 @@ pub fn BitTree(comptime wt: WordType) type {
                     const BI = B.Iterator(Context, on_active, on_inactive);
                     const bi_data: B.BitsetWithContext(Context) = .{
                         .bitset = &data.tree.bitset,
+                        .context = data.context.context,
+                    };
+                    for (start_bit_id..end_bit_id) |i| {
+                        if (!BI.step(bi_data, @truncate(i))) return false;
+                    }
+                    return true;
+                }
+            };
+        }
+
+        /// Builds a common adaptive visitor that picks flat or tree traversal.
+        /// - `Context` - caller-provided iteration context.
+        /// - `on_active` - visitor for set bits, null skips them.
+        /// - `on_inactive` - visitor for cleared bits, null skips them.
+        ///
+        /// Return - iterator type with flat and tree arms.
+        pub fn CommonIterator(
+            comptime include_len: u32,
+            comptime exclude_len: u32,
+            comptime Context: type,
+            comptime on_active: InlineIteratorCallback(Context),
+            comptime on_inactive: InlineIteratorCallback(Context),
+        ) type {
+            return struct {
+                /// Level cursor pairing trees with the current depth.
+                const CommonLayerWithContext = TreesWithContext(include_len, exclude_len, struct {
+                    /// Current pyramid depth, decremented on descent.
+                    layer_id: u32,
+                    /// Caller context forwarded to per-bit callbacks.
+                    context: Context,
+                });
+
+                /// Adapts a bit callback into a layer visitor over one word span.
+                /// - `callback` - per-bit visitor to invoke for the span.
+                ///
+                /// Return - wrapper type exposing the unwrap entry point.
+                fn ActivityUnwrapper(comptime callback: InlineIteratorCallback(Context)) type {
+                    return struct {
+                        /// Expands one summary word into per-bit visits honoring bounds.
+                        /// - `data` - trees and depth cursor.
+                        /// - `word_id` - summary word index to expand.
+                        ///
+                        /// Return - false on early exit, true when the span completed.
+                        inline fn unwrap(data: *CommonLayerWithContext, word_id: u32) bool {
+                            const layer_id = data.context.layer_id;
+                            const context = data.context.context;
+                            const first = if (include_len > 0) data.includes[0] else data.excludes[0];
+                            const end_word_id = word_id + 1;
+                            const shift: u32 = bw.shift_type_bits * layer_id;
+                            const s5: u5 = @truncate(shift);
+                            const start_bit_id = word_id << s5;
+                            var end_bit_id = end_word_id << s5;
+                            const total = first.bitset.bits_count;
+                            if (end_bit_id > total) end_bit_id = total;
+                            if (start_bit_id >= total) return true;
+
+                            for (start_bit_id..end_bit_id) |i| {
+                                if (callback) |f| {
+                                    if (!f(context, @truncate(i))) return false;
+                                }
+                            }
+                            return true;
+                        }
+                    };
+                }
+
+                /// Runs the predicted path and records the choice for inspection.
+                /// - `data` - trees and caller context.
+                ///
+                /// Return - false on early exit, true when the scan completed.
+                pub fn iterateAll(data: TreesWithContext(include_len, exclude_len, Context)) bool {
+                    if (include_len == 0 and exclude_len == 0) return true;
+                    const use_flat = predictsFlat(data.includes, data.excludes);
+                    last_predict_used_flat = use_flat;
+                    if (use_flat) return iterateFlat(data);
+                    return iterateTree(data);
+                }
+
+                /// Predicts whether a flat scan beats pyramid descent.
+                /// - `includes` - trees whose leaves are ANDed.
+                /// - `excludes` - trees whose leaves are ORed.
+                ///
+                /// Return - true for flat, false for tree.
+                pub fn predictsFlat(includes: [include_len]*Self, excludes: [exclude_len]*Self) bool {
+                    if (include_len == 0 and exclude_len == 0) return true;
+                    const cfg = predictRow(wt);
+                    switch (cfg.force) {
+                        .flat => return true,
+                        .tree => return false,
+                        .auto => {},
+                    }
+                    switch (predict_config.force) {
+                        .flat => return true,
+                        .tree => return false,
+                        .auto => {},
+                    }
+                    const first = if (include_len > 0) includes[0] else excludes[0];
+                    const n = first.bitset.bits_count;
+                    if (n == 0) return true;
+                    return predictsMinBound(includes, excludes, n, cfg);
+                }
+
+                /// Scans leaves directly without touching summaries.
+                /// - `data` - trees and caller context.
+                ///
+                /// Return - false on early exit, true when the scan completed.
+                pub fn iterateFlat(data: TreesWithContext(include_len, exclude_len, Context)) bool {
+                    const BI = B.CommonIterator(include_len, exclude_len, Context, on_active, on_inactive);
+                    var inc_sets: [include_len]*B = undefined;
+                    var exc_sets: [exclude_len]*B = undefined;
+                    inline for (0..include_len) |k| {
+                        inc_sets[k] = &data.includes[k].bitset;
+                    }
+                    inline for (0..exclude_len) |k| {
+                        exc_sets[k] = &data.excludes[k].bitset;
+                    }
+                    const bi_data: B.BitsetsWithContext(include_len, exclude_len, Context) = .{
+                        .includes = inc_sets,
+                        .excludes = exc_sets,
+                        .context = data.context,
+                    };
+                    return BI.iterateAll(bi_data);
+                }
+
+                /// Walks the pyramids from the top word down to leaves.
+                /// - `data` - trees and caller context.
+                ///
+                /// Return - false on early exit, true when the walk completed.
+                pub inline fn iterateTree(data: TreesWithContext(include_len, exclude_len, Context)) bool {
+                    const first = if (include_len > 0) data.includes[0] else data.excludes[0];
+                    const layers = first.layers.items;
+                    if (layers.len == 0) return true;
+                    const layer_id = layers.len - 1;
+                    var inc_layers: [include_len]*L = undefined;
+                    var exc_layers: [exclude_len]*L = undefined;
+                    inline for (0..include_len) |k| {
+                        inc_layers[k] = &data.includes[k].layers.items[layer_id];
+                    }
+                    inline for (0..exclude_len) |k| {
+                        exc_layers[k] = &data.excludes[k].layers.items[layer_id];
+                    }
+                    var context: CommonLayerWithContext = .{
+                        .includes = data.includes,
+                        .excludes = data.excludes,
+                        .context = .{
+                            .context = data.context,
+                            .layer_id = @truncate(layer_id),
+                        },
+                    };
+
+                    const top_words: u32 = @truncate(layers[layer_id].activity.items.len);
+                    var wid: u32 = 0;
+                    while (wid < top_words) : (wid += 1) {
+                        if (!LI.step(.{ .includes = inc_layers, .excludes = exc_layers, .context = &context }, wid)) return false;
+                    }
+
+                    return true;
+                }
+
+                /// Adapted visitor that expands inactive summary words.
+                const inactive_unwrapper = ActivityUnwrapper(on_inactive).unwrap;
+
+                /// Adapted visitor that expands active summary words.
+                const active_unwrapper = ActivityUnwrapper(on_active).unwrap;
+
+                /// Layer visitor that drives pyramid descent for both states.
+                const LI = L.CommonIterator(
+                    include_len,
+                    exclude_len,
+                    *CommonLayerWithContext,
+                    if (on_inactive != null) inactive_unwrapper else null,
+                    if (on_active != null) active_unwrapper else null,
+                    mixed_unwrapper,
+                    deep_mixed_unwrapper,
+                );
+
+                /// Upper bounds common hits from active counters without word reads.
+                /// - `includes` - trees whose leaves are ANDed.
+                /// - `excludes` - trees whose leaves are ORed.
+                /// - `n` - shared valid bits in every tree.
+                ///
+                /// Return - hit count no smaller than the true common total.
+                fn minBoundHits(includes: [include_len]*Self, excludes: [exclude_len]*Self, n: u32) u32 {
+                    const want_active = on_active != null;
+                    const want_inactive = on_inactive != null;
+                    var bound_a: u32 = n;
+                    var bound_i: u32 = n;
+                    if (want_active) {
+                        inline for (0..include_len) |k| {
+                            bound_a = @min(bound_a, includes[k].bitset.active_bits_counter);
+                        }
+                        inline for (0..exclude_len) |k| {
+                            bound_a = @min(bound_a, n - excludes[k].bitset.active_bits_counter);
+                        }
+                    }
+                    if (want_inactive) {
+                        inline for (0..include_len) |k| {
+                            bound_i = @min(bound_i, n - includes[k].bitset.active_bits_counter);
+                        }
+                        inline for (0..exclude_len) |k| {
+                            bound_i = @min(bound_i, excludes[k].bitset.active_bits_counter);
+                        }
+                    }
+                    var hits: u32 = 0;
+                    if (want_active) hits += bound_a;
+                    if (want_inactive) hits += bound_i;
+                    return hits;
+                }
+
+                /// Selects the density threshold for installed callbacks.
+                ///
+                /// Return - hit density above which flat scans win.
+                fn densityThresh() f32 {
+                    const cfg = predictRow(wt);
+                    var thresh: f32 = @min(cfg.t_active, cfg.t_inactive);
+                    if (on_active != null and on_inactive == null) thresh = cfg.t_active;
+                    if (on_inactive != null and on_active == null) thresh = cfg.t_inactive;
+                    return thresh;
+                }
+
+                /// Bounds descent coverage under mixed lanes of the top levels.
+                /// - `includes` - trees whose leaves are ANDed.
+                /// - `excludes` - trees whose leaves are ORed.
+                /// - `n` - shared valid bits in every tree.
+                ///
+                /// Return - true when the descent stays well below a full
+                /// scan: the top needs no descent, or mixed lanes of the
+                /// second level cover less than a quarter of all bits.
+                fn topPrunable(includes: [include_len]*Self, excludes: [exclude_len]*Self, n: u32) bool {
+                    const first = if (include_len > 0) includes[0] else excludes[0];
+                    const layers = first.layers.items;
+                    if (layers.len < 2) return false;
+                    const total: u64 = n;
+                    const top_id = layers.len - 1;
+                    const top = &layers[top_id];
+                    var w: u32 = 0;
+                    var top_nt = false;
+                    while (w < top.mixed.items.len) : (w += 1) {
+                        inline for (0..include_len) |k| {
+                            if (includes[k].layers.items[top_id].mixed.items[w] != 0) top_nt = true;
+                        }
+                        inline for (0..exclude_len) |k| {
+                            if (excludes[k].layers.items[top_id].mixed.items[w] != 0) top_nt = true;
+                        }
+                    }
+                    if (!top_nt) return true;
+                    const second_id = layers.len - 2;
+                    const second = &layers[second_id];
+                    const second_used = bw.bitIdInWord(second.bits_count);
+                    const second_bound: u32 = if (second_used != 0) second_used else bw.word_type_bits;
+                    var span: u64 = 1;
+                    var li: usize = 0;
+                    while (li < second_id) : (li += 1) {
+                        if (span >= total) break;
+                        span *= bw.word_type_bits;
+                    }
+                    var covered: u64 = 0;
+                    w = 0;
+                    while (w < second.mixed.items.len) : (w += 1) {
+                        var m: Word = 0;
+                        inline for (0..include_len) |k| {
+                            m |= includes[k].layers.items[second_id].mixed.items[w];
+                        }
+                        inline for (0..exclude_len) |k| {
+                            m |= excludes[k].layers.items[second_id].mixed.items[w];
+                        }
+                        const valid: u32 = if (w + 1 == second.mixed.items.len and second_used != 0) second_bound else bw.word_type_bits;
+                        var i: u32 = 0;
+                        while (i < valid) : (i += 1) {
+                            if (((m >> @truncate(i)) & 1) != 0) {
+                                const start: u64 = (@as(u64, w) * bw.word_type_bits + i) * span;
+                                if (start < total) covered += @min(span, total - start);
+                            }
+                        }
+                    }
+                    return covered * 4 < total;
+                }
+
+                /// Sums top widths and descent counters across every tree.
+                /// - `includes` - trees whose leaves are ANDed.
+                /// - `excludes` - trees whose leaves are ORed.
+                ///
+                /// Return - summed top words and mixed states.
+                fn costTopDescents(includes: [include_len]*Self, excludes: [exclude_len]*Self) struct { top_words: f32, descents: f32 } {
+                    var top_words: f32 = 0;
+                    var descents: f32 = 0;
+                    inline for (0..include_len) |k| {
+                        const items = includes[k].layers.items;
+                        top_words += @floatFromInt(items[items.len - 1].activity.items.len);
+                        var li: usize = 1;
+                        while (li < items.len) : (li += 1) {
+                            descents += @floatFromInt(items[li].state_counters[L.State.mixed_u32] + items[li].state_counters[L.State.deep_mixed_u32]);
+                        }
+                    }
+                    inline for (0..exclude_len) |k| {
+                        const items = excludes[k].layers.items;
+                        top_words += @floatFromInt(items[items.len - 1].activity.items.len);
+                        var li: usize = 1;
+                        while (li < items.len) : (li += 1) {
+                            descents += @floatFromInt(items[li].state_counters[L.State.mixed_u32] + items[li].state_counters[L.State.deep_mixed_u32]);
+                        }
+                    }
+                    return .{ .top_words = top_words, .descents = descents };
+                }
+
+                /// Compares linear estimates with zero hits for empty walks.
+                /// - `n` - shared valid bits in every tree.
+                /// - `includes` - trees whose leaves are ANDed.
+                /// - `excludes` - trees whose leaves are ORed.
+                /// - `cfg` - calibration row for the word width.
+                ///
+                /// Return - true for flat, false for tree.
+                fn predictsCostZero(n: u32, includes: [include_len]*Self, excludes: [exclude_len]*Self, cfg: *PredictConfig) bool {
+                    const w: f32 = @floatFromInt(bw.bitsToWordsCount(n));
+                    const sums = costTopDescents(includes, excludes);
+                    return cfg.c0 * w < cfg.c2 * sums.top_words + cfg.c3 * sums.descents;
+                }
+
+                /// Predicts flat from counter bounds and shared cost tables.
+                /// - `includes` - trees whose leaves are ANDed.
+                /// - `excludes` - trees whose leaves are ORed.
+                /// - `n` - shared valid bits in every tree.
+                /// - `cfg` - calibration row for the word width.
+                ///
+                /// Return - true for flat, false for tree.
+                fn predictsMinBound(includes: [include_len]*Self, excludes: [exclude_len]*Self, n: u32, cfg: *PredictConfig) bool {
+                    const hits = minBoundHits(includes, excludes, n);
+                    if (hits == 0) return predictsCostZero(n, includes, excludes, cfg);
+                    // Prunable summaries cover a small leaf fraction, so the
+                    // tree arm only pays top masks with bounded descent while
+                    // flat still merges every word: prunable favors tree here,
+                    // unlike the single-tree shortcut this mirrors.
+                    if (cfg.use_uniformity and topPrunable(includes, excludes, n)) return false;
+                    const hd: f32 = @as(f32, @floatFromInt(hits)) / @as(f32, @floatFromInt(n));
+                    if (hd > densityThresh()) return true;
+                    if (cfg.use_cost) {
+                        const w: f32 = @floatFromInt(bw.bitsToWordsCount(n));
+                        const h: f32 = @floatFromInt(hits);
+                        const sums = costTopDescents(includes, excludes);
+                        const est_flat = cfg.c0 * w + cfg.c1f * h;
+                        const est_tree = cfg.c2 * sums.top_words + cfg.c3 * sums.descents + cfg.c1t * h;
+                        if (est_flat < est_tree) return true;
+                    }
+                    return false;
+                }
+
+                /// Descends one level through a mixed summary word.
+                /// - `data` - trees and depth cursor.
+                /// - `word_id` - mixed word index to descend.
+                ///
+                /// Return - false on early exit, true when the descent completed.
+                fn mixed_unwrapper(data: *CommonLayerWithContext, word_id: u32) bool {
+                    data.context.layer_id -= 1;
+                    const layer_id: usize = data.context.layer_id;
+                    var inc_layers: [include_len]*L = undefined;
+                    var exc_layers: [exclude_len]*L = undefined;
+                    inline for (0..include_len) |k| {
+                        inc_layers[k] = &data.includes[k].layers.items[layer_id];
+                    }
+                    inline for (0..exclude_len) |k| {
+                        exc_layers[k] = &data.excludes[k].layers.items[layer_id];
+                    }
+                    const ok = LI.step(.{ .includes = inc_layers, .excludes = exc_layers, .context = data }, word_id);
+                    data.context.layer_id += 1;
+                    if (!ok) return false;
+                    return true;
+                }
+
+                /// Scans leaf words covered by a deeply mixed summary word.
+                /// - `data` - trees and depth cursor.
+                /// - `word_id` - deep-mixed word index to scan.
+                ///
+                /// Return - false on early exit, true when the scan completed.
+                inline fn deep_mixed_unwrapper(data: *CommonLayerWithContext, word_id: u32) bool {
+                    const layer_id = data.context.layer_id;
+                    const end_word_id = word_id + 1;
+                    const shift: u32 = bw.shift_type_bits * (layer_id - 1);
+                    const s5: u5 = @truncate(shift);
+                    const start_bit_id = word_id << s5;
+                    var end_bit_id = end_word_id << s5;
+                    const first = if (include_len > 0) data.includes[0] else data.excludes[0];
+                    const words_len: u32 = @truncate(first.bitset.words.items.len);
+                    if (end_bit_id > words_len) end_bit_id = words_len;
+                    if (start_bit_id >= words_len) return true;
+
+                    const BI = B.CommonIterator(include_len, exclude_len, Context, on_active, on_inactive);
+                    var inc_sets: [include_len]*B = undefined;
+                    var exc_sets: [exclude_len]*B = undefined;
+                    inline for (0..include_len) |k| {
+                        inc_sets[k] = &data.includes[k].bitset;
+                    }
+                    inline for (0..exclude_len) |k| {
+                        exc_sets[k] = &data.excludes[k].bitset;
+                    }
+                    const bi_data: B.BitsetsWithContext(include_len, exclude_len, Context) = .{
+                        .includes = inc_sets,
+                        .excludes = exc_sets,
                         .context = data.context.context,
                     };
                     for (start_bit_id..end_bit_id) |i| {
@@ -1256,4 +1668,481 @@ test "BitTree CommonIterator cross: summary layer vs bitset 262144" {
     }
     try t.expectEqual(bctx.active.items.len, lock.ca);
     try t.expectEqual(bctx.inactive.items.len, lock.ci);
+}
+
+const CommonTreePattern = enum { zero, one, alt01, alt10, every3, pseudo };
+
+fn commonTreePatternBit(pat: CommonTreePattern, i: u32) BitState {
+    return switch (pat) {
+        .zero => .inactive,
+        .one => .active,
+        .alt01 => if ((i & 1) == 0) .active else .inactive,
+        .alt10 => if ((i & 1) == 0) .inactive else .active,
+        .every3 => if ((i % 3) == 0) .active else .inactive,
+        .pseudo => if ((((i *% 1664525) +% 1013904223) >> 15) & 1 == 1) .active else .inactive,
+    };
+}
+
+fn initCommonTree(comptime wt: WordType, n: u32, pat: CommonTreePattern) !BitTree(wt) {
+    var tree = BitTree(wt){};
+    errdefer tree.deinit(t.allocator);
+    try tree.resize(t.allocator, n, .inactive);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        if (commonTreePatternBit(pat, i) == .active) tree.setBit(i, .active);
+    }
+    return tree;
+}
+
+fn commonTreeCollectAll(
+    comptime wt: WordType,
+    comptime IL: u32,
+    comptime EL: u32,
+    comptime on_a: InlineIteratorCallback(*TreeStepIds),
+    comptime on_i: InlineIteratorCallback(*TreeStepIds),
+    includes: [IL]*BitTree(wt),
+    excludes: [EL]*BitTree(wt),
+    ctx: *TreeStepIds,
+) bool {
+    const It = BitTree(wt).CommonIterator(IL, EL, *TreeStepIds, on_a, on_i);
+    return It.iterateAll(.{ .includes = includes, .excludes = excludes, .context = ctx });
+}
+
+fn commonTreeOracleIds(
+    comptime wt: WordType,
+    comptime IL: u32,
+    comptime EL: u32,
+    includes: [IL]*BitTree(wt),
+    excludes: [EL]*BitTree(wt),
+    n: u32,
+    out_a: *[512]u32,
+    out_i: *[512]u32,
+) struct { na: usize, ni: usize } {
+    const BW = bit_word.BitWord(wt);
+    var na: usize = 0;
+    var ni: usize = 0;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const wid: usize = @intCast(BW.bitToWordId(i));
+        const bid = BW.bitIdInWord(i);
+        var is_a = true;
+        var is_i = true;
+        for (includes) |tree| {
+            const st = BW.readBitState(tree.bitset.words.items[wid], bid);
+            if (st != .active) is_a = false;
+            if (st != .inactive) is_i = false;
+        }
+        for (excludes) |tree| {
+            const st = BW.readBitState(tree.bitset.words.items[wid], bid);
+            if (st != .inactive) is_a = false;
+            if (st != .active) is_i = false;
+        }
+        if (is_a) {
+            out_a[na] = i;
+            na += 1;
+        }
+        if (is_i) {
+            out_i[ni] = i;
+            ni += 1;
+        }
+    }
+    return .{ .na = na, .ni = ni };
+}
+
+fn commonTreeCheckOne(
+    comptime wt: WordType,
+    comptime IL: u32,
+    comptime EL: u32,
+    n: u32,
+    pats_inc: [IL]CommonTreePattern,
+    pats_exc: [EL]CommonTreePattern,
+) !void {
+    var inc_sets: [IL]BitTree(wt) = undefined;
+    var exc_sets: [EL]BitTree(wt) = undefined;
+    for (0..IL) |k| inc_sets[k] = try initCommonTree(wt, n, pats_inc[k]);
+    for (0..EL) |k| exc_sets[k] = try initCommonTree(wt, n, pats_exc[k]);
+    defer {
+        for (0..IL) |k| inc_sets[k].deinit(t.allocator);
+        for (0..EL) |k| exc_sets[k].deinit(t.allocator);
+    }
+    var inc_ptrs: [IL]*BitTree(wt) = undefined;
+    var exc_ptrs: [EL]*BitTree(wt) = undefined;
+    for (0..IL) |k| inc_ptrs[k] = &inc_sets[k];
+    for (0..EL) |k| exc_ptrs[k] = &exc_sets[k];
+
+    var exp_a: [512]u32 = undefined;
+    var exp_i: [512]u32 = undefined;
+    const exp = commonTreeOracleIds(wt, IL, EL, inc_ptrs, exc_ptrs, n, &exp_a, &exp_i);
+
+    {
+        const It = BitTree(wt).CommonIterator(IL, EL, *TreeStepIds, treePushA, treePushI);
+        var ctx = TreeStepIds{};
+        try t.expect(commonTreeCollectAll(wt, IL, EL, treePushA, treePushI, inc_ptrs, exc_ptrs, &ctx));
+        try t.expectEqualSlices(u32, exp_a[0..exp.na], ctx.active[0..ctx.na]);
+        try t.expectEqualSlices(u32, exp_i[0..exp.ni], ctx.inactive[0..ctx.ni]);
+        try t.expectEqual(last_predict_used_flat, It.predictsFlat(inc_ptrs, exc_ptrs));
+    }
+    {
+        const It = BitTree(wt).CommonIterator(IL, EL, *TreeStepIds, treePushA, treePushI);
+        var fa = TreeStepIds{};
+        try t.expect(It.iterateFlat(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &fa }));
+        try t.expectEqualSlices(u32, exp_a[0..exp.na], fa.active[0..fa.na]);
+        try t.expectEqualSlices(u32, exp_i[0..exp.ni], fa.inactive[0..fa.ni]);
+        var ta = TreeStepIds{};
+        try t.expect(It.iterateTree(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ta }));
+        try t.expectEqualSlices(u32, exp_a[0..exp.na], ta.active[0..ta.na]);
+        try t.expectEqualSlices(u32, exp_i[0..exp.ni], ta.inactive[0..ta.ni]);
+    }
+    {
+        var ctx = TreeStepIds{};
+        try t.expect(commonTreeCollectAll(wt, IL, EL, treePushA, null, inc_ptrs, exc_ptrs, &ctx));
+        try t.expectEqualSlices(u32, exp_a[0..exp.na], ctx.active[0..ctx.na]);
+        try t.expectEqual(@as(usize, 0), ctx.ni);
+    }
+    {
+        var ctx = TreeStepIds{};
+        try t.expect(commonTreeCollectAll(wt, IL, EL, null, treePushI, inc_ptrs, exc_ptrs, &ctx));
+        try t.expectEqualSlices(u32, exp_i[0..exp.ni], ctx.inactive[0..ctx.ni]);
+        try t.expectEqual(@as(usize, 0), ctx.na);
+    }
+}
+
+fn commonTreeCheckSingleMatchesIterator(comptime wt: WordType, n: u32, pat: CommonTreePattern) !void {
+    var tree = try initCommonTree(wt, n, pat);
+    defer tree.deinit(t.allocator);
+
+    var exp_a: [512]u32 = undefined;
+    var exp_i: [512]u32 = undefined;
+    const n_a = treeOracleIds(wt, &tree, .active, &exp_a);
+    const n_i = treeOracleIds(wt, &tree, .inactive, &exp_i);
+
+    {
+        var got = TreeStepIds{};
+        try t.expect(commonTreeCollectAll(wt, 1, 0, treePushA, treePushI, .{&tree}, .{}, &got));
+        try t.expectEqualSlices(u32, exp_a[0..n_a], got.active[0..got.na]);
+        try t.expectEqualSlices(u32, exp_i[0..n_i], got.inactive[0..got.ni]);
+    }
+
+    var ref = TreeStepIds{};
+    treeStepCollectAll(wt, &tree, &ref);
+    var got = TreeStepIds{};
+    try t.expect(commonTreeCollectAll(wt, 1, 0, treePushA, treePushI, .{&tree}, .{}, &got));
+    try t.expectEqualSlices(u32, ref.active[0..ref.na], got.active[0..got.na]);
+    try t.expectEqualSlices(u32, ref.inactive[0..ref.ni], got.inactive[0..got.ni]);
+}
+
+test "BitTree CommonIterator: 1+0 matches Iterator" {
+    const sizes = [_]u32{ 0, 1, 2, 7, 8, 9, 63, 64, 65, 70, 128, 129, 200, 300 };
+    const patterns = [_]CommonTreePattern{ .zero, .one, .alt01, .alt10, .every3, .pseudo };
+    for (sizes) |n| {
+        for (patterns) |pat| {
+            try commonTreeCheckSingleMatchesIterator(.u64, n, pat);
+            try commonTreeCheckSingleMatchesIterator(.u8, n, pat);
+        }
+    }
+}
+
+test "BitTree CommonIterator: oracle corners 2+2" {
+    const sizes_u64 = [_]u32{ 0, 1, 2, 7, 8, 9, 63, 64, 65, 70, 129, 200 };
+    const sizes_u8 = [_]u32{ 0, 1, 7, 8, 9, 16, 17, 33 };
+    const pats = [_]CommonTreePattern{ .zero, .one, .alt01, .pseudo };
+    for (sizes_u64) |n| {
+        for (pats) |p0| {
+            for (pats) |p1| {
+                try commonTreeCheckOne(.u64, 2, 2, n, .{ p0, p1 }, .{ p1, p0 });
+            }
+        }
+    }
+    for (sizes_u8) |n| {
+        for (pats) |p0| {
+            for (pats) |p1| {
+                try commonTreeCheckOne(.u8, 2, 2, n, .{ p0, p1 }, .{ p1, p0 });
+            }
+        }
+    }
+}
+
+test "BitTree CommonIterator: oracle corners 1+1 exhaustive patterns" {
+    const sizes = [_]u32{ 0, 1, 2, 7, 8, 9, 16, 17, 63, 64, 65, 70, 129, 200 };
+    const patterns = [_]CommonTreePattern{ .zero, .one, .alt01, .alt10, .every3, .pseudo };
+    for (sizes) |n| {
+        for (patterns) |pi| {
+            for (patterns) |pe| {
+                try commonTreeCheckOne(.u64, 1, 1, n, .{pi}, .{pe});
+                try commonTreeCheckOne(.u8, 1, 1, n, .{pi}, .{pe});
+            }
+        }
+    }
+}
+
+test "BitTree CommonIterator: oracle corners mixed lens" {
+    const sizes = [_]u32{ 0, 1, 8, 9, 17, 64, 65, 70, 130 };
+    const pats = [_]CommonTreePattern{ .zero, .one, .alt01, .pseudo };
+    for (sizes) |n| {
+        for (pats) |p0| {
+            for (pats) |p1| {
+                try commonTreeCheckOne(.u64, 2, 1, n, .{ p0, p1 }, .{p0});
+                try commonTreeCheckOne(.u64, 1, 2, n, .{p0}, .{ p0, p1 });
+                try commonTreeCheckOne(.u64, 3, 1, n, .{ p0, p1, p0 }, .{p1});
+                try commonTreeCheckOne(.u64, 1, 3, n, .{p0}, .{ p0, p1, p0 });
+                try commonTreeCheckOne(.u8, 2, 0, n, .{ p0, p1 }, .{});
+                try commonTreeCheckOne(.u8, 0, 2, n, .{}, .{ p0, p1 });
+            }
+        }
+    }
+}
+
+test "BitTree CommonIterator: oracle word types u16/u32" {
+    const sizes16 = [_]u32{ 0, 1, 15, 16, 17, 33 };
+    const sizes32 = [_]u32{ 0, 1, 31, 32, 33, 65 };
+    const pats = [_]CommonTreePattern{ .zero, .one, .alt01, .pseudo };
+    for (sizes16) |n| {
+        for (pats) |p0| {
+            for (pats) |p1| {
+                try commonTreeCheckOne(.u16, 2, 2, n, .{ p0, p1 }, .{ p1, p0 });
+                try commonTreeCheckOne(.u16, 1, 1, n, .{p0}, .{p1});
+            }
+        }
+    }
+    for (sizes32) |n| {
+        for (pats) |p0| {
+            for (pats) |p1| {
+                try commonTreeCheckOne(.u32, 2, 2, n, .{ p0, p1 }, .{ p1, p0 });
+                try commonTreeCheckOne(.u32, 1, 1, n, .{p0}, .{p1});
+            }
+        }
+    }
+}
+
+test "BitTree CommonIterator: boundary oracle u64" {
+    const bounds = [_]u32{ 0, 1, 2, 63, 64, 65, 70, 100, 126, 127, 128, 129, 130, 191, 192, 193, 200, 300 };
+    const pats = [_]CommonTreePattern{ .zero, .one, .alt01, .alt10, .every3, .pseudo };
+    for (bounds) |n| {
+        for (pats) |pi| {
+            try commonTreeCheckOne(.u64, 2, 2, n, .{ pi, .pseudo }, .{ .alt01, pi });
+            try commonTreeCheckOne(.u64, 1, 1, n, .{pi}, .{.pseudo});
+        }
+    }
+}
+
+fn commonTreeRandU32(state: *u64) u32 {
+    var x = state.*;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    state.* = x;
+    return @truncate((x *% 0x2545F4914F6CDD1D) >> 32);
+}
+
+test "BitTree CommonIterator: fuzz vs oracle u64 2+2" {
+    var rng: u64 = 0x9E3779B97F4A7C15;
+    var step: usize = 0;
+    while (step < 150) : (step += 1) {
+        const n: u32 = commonTreeRandU32(&rng) % 201;
+        errdefer std.debug.print("COMMON TREE FUZZ u64 2+2 fail step={} n={}\n", .{ step, n });
+        var inc_sets: [2]BitTree(.u64) = .{ .{}, .{} };
+        var exc_sets: [2]BitTree(.u64) = .{ .{}, .{} };
+        defer {
+            for (0..2) |k| inc_sets[k].deinit(t.allocator);
+            for (0..2) |k| exc_sets[k].deinit(t.allocator);
+        }
+        for (0..2) |k| try inc_sets[k].resize(t.allocator, n, .inactive);
+        for (0..2) |k| try exc_sets[k].resize(t.allocator, n, .inactive);
+        for (0..2) |k| {
+            var w: usize = 0;
+            while (w < inc_sets[k].bitset.words.items.len) : (w += 1) {
+                const word: u64 = (@as(u64, commonTreeRandU32(&rng)) << 32) | commonTreeRandU32(&rng);
+                inc_sets[k].setWord(@truncate(w), word, std.math.maxInt(u64));
+            }
+        }
+        for (0..2) |k| {
+            var w: usize = 0;
+            while (w < exc_sets[k].bitset.words.items.len) : (w += 1) {
+                const word: u64 = (@as(u64, commonTreeRandU32(&rng)) << 32) | commonTreeRandU32(&rng);
+                exc_sets[k].setWord(@truncate(w), word, std.math.maxInt(u64));
+            }
+        }
+        var exp_a: [512]u32 = undefined;
+        var exp_i: [512]u32 = undefined;
+        const exp = commonTreeOracleIds(.u64, 2, 2, .{ &inc_sets[0], &inc_sets[1] }, .{ &exc_sets[0], &exc_sets[1] }, n, &exp_a, &exp_i);
+        var ctx = TreeStepIds{};
+        try t.expect(commonTreeCollectAll(.u64, 2, 2, treePushA, treePushI, .{ &inc_sets[0], &inc_sets[1] }, .{ &exc_sets[0], &exc_sets[1] }, &ctx));
+        try t.expectEqualSlices(u32, exp_a[0..exp.na], ctx.active[0..ctx.na]);
+        try t.expectEqualSlices(u32, exp_i[0..exp.ni], ctx.inactive[0..ctx.ni]);
+    }
+}
+
+test "BitTree CommonIterator: null side is skipped" {
+    {
+        var inc0 = try initCommonTree(.u64, 70, .zero);
+        var inc1 = try initCommonTree(.u64, 70, .zero);
+        var exc0 = try initCommonTree(.u64, 70, .zero);
+        var exc1 = try initCommonTree(.u64, 70, .zero);
+        defer inc0.deinit(t.allocator);
+        defer inc1.deinit(t.allocator);
+        defer exc0.deinit(t.allocator);
+        defer exc1.deinit(t.allocator);
+        inc0.setBit(5, .active);
+        inc1.setBit(5, .active);
+        inc0.setBit(69, .active);
+        inc1.setBit(69, .active);
+        exc0.setBit(69, .active);
+        var ctx = TreeStepIds{};
+        try t.expect(commonTreeCollectAll(.u64, 2, 2, treePushA, null, .{ &inc0, &inc1 }, .{ &exc0, &exc1 }, &ctx));
+        try t.expectEqualSlices(u32, &[_]u32{5}, ctx.active[0..ctx.na]);
+        try t.expectEqual(@as(usize, 0), ctx.ni);
+    }
+    {
+        var inc = try initCommonTree(.u8, 10, .zero);
+        var exc = try initCommonTree(.u8, 10, .zero);
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        exc.setBit(3, .active);
+        var ctx = TreeStepIds{};
+        try t.expect(commonTreeCollectAll(.u8, 1, 1, null, treePushI, .{&inc}, .{&exc}, &ctx));
+        try t.expectEqualSlices(u32, &[_]u32{3}, ctx.inactive[0..ctx.ni]);
+        try t.expectEqual(@as(usize, 0), ctx.na);
+    }
+}
+
+test "BitTree CommonIterator: early exit stops the walk" {
+    {
+        var inc = try initCommonTree(.u64, 70, .one);
+        var exc = try initCommonTree(.u64, 70, .zero);
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        const It = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, treePushI);
+        var ctx = TreeStepIds{ .stop_after = 3 };
+        try t.expect(!It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }));
+        try t.expectEqual(@as(usize, 3), ctx.na);
+        try t.expectEqual(@as(usize, 0), ctx.ni);
+        try t.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, ctx.active[0..ctx.na]);
+    }
+    {
+        var inc = try initCommonTree(.u64, 130, .one);
+        var exc = try initCommonTree(.u64, 130, .zero);
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        const It = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, treePushI);
+        var ctx = TreeStepIds{ .stop_after = 70 };
+        try t.expect(!It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }));
+        try t.expectEqual(@as(usize, 70), ctx.na);
+        try t.expectEqual(@as(u32, 69), ctx.active[69]);
+    }
+    {
+        var inc = try initCommonTree(.u64, 10, .zero);
+        var exc = try initCommonTree(.u64, 10, .zero);
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        inc.setBit(0, .active);
+        exc.setBit(5, .active);
+        const It = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, treePushI);
+        var ctx = TreeStepIds{ .stop_after = 2 };
+        try t.expect(!It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }));
+        try t.expectEqualSlices(u32, &[_]u32{0}, ctx.active[0..ctx.na]);
+        try t.expectEqualSlices(u32, &[_]u32{5}, ctx.inactive[0..ctx.ni]);
+    }
+    {
+        var inc = try initCommonTree(.u64, 10, .one);
+        var exc = try initCommonTree(.u64, 10, .zero);
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        const It = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, treePushI);
+        var ctx = TreeStepIds{ .stop_after = 50 };
+        try t.expect(It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }));
+        try t.expectEqual(@as(usize, 10), ctx.na);
+    }
+}
+
+test "BitTree CommonIterator: empty sets and zero lens" {
+    {
+        var inc0: BitTree(.u64) = .{};
+        var inc1: BitTree(.u64) = .{};
+        var exc0: BitTree(.u64) = .{};
+        var exc1: BitTree(.u64) = .{};
+        defer inc0.deinit(t.allocator);
+        defer inc1.deinit(t.allocator);
+        defer exc0.deinit(t.allocator);
+        defer exc1.deinit(t.allocator);
+        var ctx = TreeStepIds{};
+        try t.expect(commonTreeCollectAll(.u64, 2, 2, treePushA, treePushI, .{ &inc0, &inc1 }, .{ &exc0, &exc1 }, &ctx));
+        try t.expectEqual(@as(usize, 0), ctx.total());
+    }
+    {
+        const It00 = BitTree(.u64).CommonIterator(0, 0, *TreeStepIds, treePushA, treePushI);
+        var ctx = TreeStepIds{};
+        try t.expect(It00.iterateAll(.{ .includes = .{}, .excludes = .{}, .context = &ctx }));
+        try t.expect(It00.predictsFlat(.{}, .{}));
+        try t.expectEqual(@as(usize, 0), ctx.total());
+    }
+    {
+        var exc = try initCommonTree(.u8, 10, .zero);
+        defer exc.deinit(t.allocator);
+        exc.setBit(5, .active);
+        var ctx = TreeStepIds{};
+        try t.expect(commonTreeCollectAll(.u8, 0, 1, treePushA, treePushI, .{}, .{&exc}, &ctx));
+        try t.expectEqual(@as(usize, 9), ctx.na);
+        try t.expectEqualSlices(u32, &[_]u32{5}, ctx.inactive[0..ctx.ni]);
+    }
+}
+
+test "BitTree CommonIterator: prunable picks tree" {
+    const ItA = BitTree(.u64).CommonIterator(2, 2, *TreeStepIds, treePushA, null);
+    {
+        var sets: [4]BitTree(.u64) = .{ .{}, .{}, .{}, .{} };
+        defer {
+            for (0..4) |k| sets[k].deinit(t.allocator);
+        }
+        for (0..4) |k| try sets[k].resize(t.allocator, 4096, .inactive);
+        var b: u32 = 0;
+        while (b < 2048) : (b += 1) {
+            for (0..4) |k| sets[k].setBit(b, .active);
+        }
+        try t.expect(!ItA.predictsFlat(.{ &sets[0], &sets[1] }, .{ &sets[2], &sets[3] }));
+    }
+    {
+        var inc0 = try initCommonTree(.u64, 4096, .zero);
+        var inc1 = try initCommonTree(.u64, 4096, .zero);
+        var exc0 = try initCommonTree(.u64, 4096, .zero);
+        var exc1 = try initCommonTree(.u64, 4096, .zero);
+        defer inc0.deinit(t.allocator);
+        defer inc1.deinit(t.allocator);
+        defer exc0.deinit(t.allocator);
+        defer exc1.deinit(t.allocator);
+        var b: u32 = 0;
+        while (b < 2000) : (b += 1) {
+            inc0.setBit(b, .active);
+            inc1.setBit(b + 2000, .active);
+        }
+        try t.expect(!ItA.predictsFlat(.{ &inc0, &inc1 }, .{ &exc0, &exc1 }));
+    }
+    {
+        var inc = try initCommonTree(.u64, 70, .one);
+        var exc = try initCommonTree(.u64, 70, .zero);
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        const It1 = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, null);
+        try t.expect(!It1.predictsFlat(.{&inc}, .{&exc}));
+    }
+    {
+        var inc = try initCommonTree(.u64, 200, .pseudo);
+        var exc = try initCommonTree(.u64, 200, .one);
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        const It1 = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, null);
+        try t.expect(It1.predictsFlat(.{&inc}, .{&exc}));
+    }
+    {
+        var inc = try initCommonTree(.u64, 200, .zero);
+        var exc = try initCommonTree(.u64, 200, .zero);
+        defer inc.deinit(t.allocator);
+        defer exc.deinit(t.allocator);
+        var w: u32 = 0;
+        while (w < 4) : (w += 1) {
+            inc.setWord(w, 0xAAAAAAAAAAAAAAAA, std.math.maxInt(u64));
+            exc.setWord(w, 0xAAAAAAAAAAAAAAAA, std.math.maxInt(u64));
+        }
+        const It1 = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, null);
+        try t.expect(It1.predictsFlat(.{&inc}, .{&exc}));
+    }
 }

@@ -452,6 +452,480 @@ fn benchFill(
     try rows.append(alloc, .{ .name = try alloc.dupe(u8, name), .elements = check / reps, .ms = ns / 1_000_000.0 });
 }
 
+/// Callback mode selecting installed common visitors.
+const CommonMode = enum { active_only, inactive_only, both };
+
+/// Pinned per-id collector for common walks with dual lists.
+const CommonCtx = struct {
+    /// Active ids in visit order, capacity reserved upfront.
+    active: std.ArrayListUnmanaged(u32) = .empty,
+    /// Inactive ids in visit order, capacity reserved upfront.
+    inactive: std.ArrayListUnmanaged(u32) = .empty,
+    /// Appends one active id without reallocation checks in hot code.
+    ///
+    /// Return - always true to continue the scan.
+    inline fn pushA(ctx: *CommonCtx, id: u32) bool {
+        ctx.active.appendAssumeCapacity(id);
+        return true;
+    }
+    /// Appends one inactive id without reallocation checks in hot code.
+    ///
+    /// Return - always true to continue the scan.
+    inline fn pushI(ctx: *CommonCtx, id: u32) bool {
+        ctx.inactive.appendAssumeCapacity(id);
+        return true;
+    }
+};
+
+/// Median of per-repetition timings, robust against noise spikes.
+/// - `samples` - nanosecond samples, sorted in place.
+///
+/// Return - middle sample.
+fn medianNs(samples: []u64) u64 {
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    return samples[samples.len / 2];
+}
+
+/// Verifies one common walk against word-built oracle sets.
+/// - `alloc` - owns temporary id lists.
+/// - `includes` - trees whose leaves are ANDed.
+/// - `excludes` - trees whose leaves are ORed.
+/// - `n` - shared valid bits.
+/// - `name` - scenario label for mismatch reports.
+///
+/// Return - oracle active and inactive totals.
+fn verifyCommon(
+    comptime IL: u32,
+    comptime EL: u32,
+    alloc: Allocator,
+    includes: [IL]*Tree,
+    excludes: [EL]*Tree,
+    n: u32,
+    name: []const u8,
+) !struct { na: usize, ni: usize } {
+    var exp_a: std.ArrayListUnmanaged(u32) = .empty;
+    defer exp_a.deinit(alloc);
+    var exp_i: std.ArrayListUnmanaged(u32) = .empty;
+    defer exp_i.deinit(alloc);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const wid = i >> 6;
+        const bit: u6 = @truncate(i);
+        const m: u64 = @as(u64, 1) << bit;
+        var is_a = true;
+        var is_i = true;
+        for (includes) |tree| {
+            const b = (tree.bitset.words.items[wid] & m) != 0;
+            if (!b) is_a = false;
+            if (b) is_i = false;
+        }
+        for (excludes) |tree| {
+            const b = (tree.bitset.words.items[wid] & m) != 0;
+            if (b) is_a = false;
+            if (!b) is_i = false;
+        }
+        if (is_a) try exp_a.append(alloc, i);
+        if (is_i) try exp_i.append(alloc, i);
+    }
+    var vc = CommonCtx{};
+    defer vc.active.deinit(alloc);
+    defer vc.inactive.deinit(alloc);
+    try vc.active.ensureTotalCapacity(alloc, exp_a.items.len);
+    try vc.inactive.ensureTotalCapacity(alloc, exp_i.items.len);
+    {
+        const It = Tree.CommonIterator(IL, EL, *CommonCtx, CommonCtx.pushA, CommonCtx.pushI);
+        _ = It.iterateAll(.{
+            .includes = includes,
+            .excludes = excludes,
+            .context = &vc,
+        });
+    }
+    if (!std.mem.eql(u32, vc.active.items, exp_a.items)) {
+        std.debug.print("verify {s}: active set mismatch got={d} exp={d}\n", .{ name, vc.active.items.len, exp_a.items.len });
+        return error.VerifyMismatch;
+    }
+    if (!std.mem.eql(u32, vc.inactive.items, exp_i.items)) {
+        std.debug.print("verify {s}: inactive set mismatch got={d} exp={d}\n", .{ name, vc.inactive.items.len, exp_i.items.len });
+        return error.VerifyMismatch;
+    }
+    return .{ .na = exp_a.items.len, .ni = exp_i.items.len };
+}
+
+/// Times one common arm once, pinning every visited id.
+/// - `io` - clock source for the interval.
+/// - `includes` - trees whose leaves are ANDed.
+/// - `excludes` - trees whose leaves are ORed.
+/// - `mode` - installed callback subset.
+/// - `ctx` - reused collector with reserved capacity.
+/// - `arm` - forced flat, forced tree, or predicted auto.
+///
+/// Return - elapsed nanoseconds.
+fn timeCommonArm(
+    comptime IL: u32,
+    comptime EL: u32,
+    comptime mode: CommonMode,
+    io: std.Io,
+    includes: [IL]*Tree,
+    excludes: [EL]*Tree,
+    ctx: *CommonCtx,
+    arm: u32,
+) u64 {
+    const on_a = if (mode == .inactive_only) null else CommonCtx.pushA;
+    const on_i = if (mode == .active_only) null else CommonCtx.pushI;
+    const It = Tree.CommonIterator(IL, EL, *CommonCtx, on_a, on_i);
+    const data: Tree.TreesWithContext(IL, EL, *CommonCtx) = .{ .includes = includes, .excludes = excludes, .context = ctx };
+    ctx.active.clearRetainingCapacity();
+    ctx.inactive.clearRetainingCapacity();
+    var watch = Stopwatch.start(io);
+    if (arm == 0) {
+        _ = It.iterateFlat(data);
+    } else if (arm == 1) {
+        _ = It.iterateTree(data);
+    } else {
+        _ = It.iterateAll(data);
+    }
+    const ns = watch.read();
+    std.mem.doNotOptimizeAway(ctx.active.items.len + ctx.inactive.items.len);
+    return ns;
+}
+
+/// One common scenario result for the flat/tree/auto table.
+const CommonBenchResult = struct {
+    /// Scenario label, static storage.
+    name: []const u8,
+    /// Milliseconds per repetition per arm.
+    ms: [3]f64,
+    /// Auto choice, true for flat.
+    choice_flat: bool,
+    /// Faster arm, true for flat.
+    faster_flat: bool,
+    /// Race inside the noise margin, choice not judged.
+    tied: bool,
+    /// Judged choice matches the faster arm.
+    ok: bool,
+};
+
+/// Benchmarks flat/tree/auto arms of one common scenario with medians.
+/// - `io` - clock source for timing.
+/// - `alloc` - owns temporary id lists.
+/// - `name` - scenario label, static storage.
+/// - `includes` - trees whose leaves are ANDed.
+/// - `excludes` - trees whose leaves are ORed.
+/// - `n` - shared valid bits.
+/// - `mode` - installed callback subset.
+///
+/// Return - medians with the auto choice and match flag.
+fn benchCommonMode(
+    comptime IL: u32,
+    comptime EL: u32,
+    comptime mode: CommonMode,
+    io: std.Io,
+    alloc: Allocator,
+    name: []const u8,
+    includes: [IL]*Tree,
+    excludes: [EL]*Tree,
+    n: u32,
+) !CommonBenchResult {
+    _ = try verifyCommon(IL, EL, alloc, includes, excludes, n, name);
+    var lists = CommonCtx{};
+    defer lists.active.deinit(alloc);
+    defer lists.inactive.deinit(alloc);
+    try lists.active.ensureTotalCapacity(alloc, n);
+    try lists.inactive.ensureTotalCapacity(alloc, n);
+    const on_a = if (mode == .inactive_only) null else CommonCtx.pushA;
+    const on_i = if (mode == .active_only) null else CommonCtx.pushI;
+    const It = Tree.CommonIterator(IL, EL, *CommonCtx, on_a, on_i);
+    var ms: [3]f64 = undefined;
+    var a: usize = 0;
+    while (a < 3) : (a += 1) {
+        _ = timeCommonArm(IL, EL, mode, io, includes, excludes, &lists, @truncate(a));
+        var samples: [7]u64 = undefined;
+        for (0..7) |r| samples[r] = timeCommonArm(IL, EL, mode, io, includes, excludes, &lists, @truncate(a));
+        ms[a] = @as(f64, @floatFromInt(medianNs(&samples))) / 1_000_000.0;
+    }
+    const choice_flat = It.predictsFlat(includes, excludes);
+    bit_tree.last_predict_used_flat = choice_flat;
+    const faster_flat = ms[0] < ms[1];
+    const lo = if (faster_flat) ms[0] else ms[1];
+    const margin = if (lo > 0) @abs(ms[0] - ms[1]) / lo else 0;
+    const tied = margin < 0.25;
+    return .{
+        .name = name,
+        .ms = ms,
+        .choice_flat = choice_flat,
+        .faster_flat = faster_flat,
+        .tied = tied,
+        .ok = tied or choice_flat == faster_flat,
+    };
+}
+
+/// Prints one compact flat/tree/auto table without history columns.
+/// - `results` - per-scenario medians with choices.
+fn printCommonTable(results: []const CommonBenchResult) void {
+    std.debug.print("common flat/tree/auto (ms/rep median, match: ok, MISS, - tie)\n", .{});
+    std.debug.print("{s:<24} {s:>10} {s:>10} {s:>10} {s:>6} {s:>5}\n", .{ "scenario", "flat", "tree", "auto", "choice", "match" });
+    for (results) |r| {
+        const mark: []const u8 = if (r.tied) "-" else if (r.ok) "ok" else "MISS";
+        std.debug.print("{s:<24} {d:>10.3} {d:>10.3} {d:>10.3} {s:>6} {s:>5}\n", .{
+            r.name,
+            r.ms[0],
+            r.ms[1],
+            r.ms[2],
+            if (r.choice_flat) "flat" else "tree",
+            mark,
+        });
+    }
+}
+
+/// Xorshift generator for deterministic common scenario fills.
+/// - `state` - evolving generator state.
+///
+/// Return - next pseudorandom word halves.
+fn commonBenchRandU32(state: *u64) u32 {
+    var x = state.*;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    state.* = x;
+    return @truncate((x *% 0x2545F4914F6CDD1D) >> 32);
+}
+
+/// Resizes every tree inactive, first group active instead.
+/// - `trees` - scenario trees, includes first.
+/// - `inc_len` - leading include count.
+/// - `alloc` - owns backing storage.
+/// - `n` - shared valid bits.
+fn fillUniA_UniI(trees: []*Tree, inc_len: u32, alloc: Allocator, n: u32) !void {
+    for (trees, 0..) |tree, k| {
+        try tree.resize(alloc, n, if (k < inc_len) .active else .inactive);
+    }
+}
+
+/// Resizes every tree inactive, trailing group active instead.
+/// - `trees` - scenario trees, includes first.
+/// - `inc_len` - leading include count.
+/// - `alloc` - owns backing storage.
+/// - `n` - shared valid bits.
+fn fillUniI_UniA(trees: []*Tree, inc_len: u32, alloc: Allocator, n: u32) !void {
+    for (trees, 0..) |tree, k| {
+        try tree.resize(alloc, n, if (k < inc_len) .inactive else .active);
+    }
+}
+
+/// Resizes every tree active for inactive-heavy queries.
+/// - `trees` - scenario trees, includes first.
+/// - `inc_len` - leading include count, unused.
+/// - `alloc` - owns backing storage.
+/// - `n` - shared valid bits.
+fn fillUniA_All(trees: []*Tree, inc_len: u32, alloc: Allocator, n: u32) !void {
+    _ = inc_len;
+    for (trees) |tree| try tree.resize(alloc, n, .active);
+}
+
+/// Writes one strided active pattern into every tree.
+/// - `trees` - scenario trees, includes first.
+/// - `inc_len` - leading include count, unused.
+/// - `alloc` - owns backing storage.
+/// - `n` - shared valid bits.
+fn fillStride997(trees: []*Tree, inc_len: u32, alloc: Allocator, n: u32) !void {
+    _ = inc_len;
+    for (trees) |tree| {
+        try tree.resize(alloc, n, .inactive);
+        var b: u32 = 0;
+        while (b < n) : (b += 997) tree.setBit(b, .active);
+    }
+}
+
+/// Writes a single active bit into the first tree only.
+/// - `trees` - scenario trees, includes first.
+/// - `inc_len` - leading include count, unused.
+/// - `alloc` - owns backing storage.
+/// - `n` - shared valid bits.
+fn fillSingleBit(trees: []*Tree, inc_len: u32, alloc: Allocator, n: u32) !void {
+    _ = inc_len;
+    for (trees) |tree| try tree.resize(alloc, n, .inactive);
+    trees[0].setBit(0, .active);
+}
+
+/// Writes alternating random, cleared and filled words into every tree.
+/// - `trees` - scenario trees, includes first.
+/// - `inc_len` - leading include count, unused.
+/// - `alloc` - owns backing storage.
+/// - `n` - shared valid bits.
+fn fillAlternation(trees: []*Tree, inc_len: u32, alloc: Allocator, n: u32) !void {
+    _ = inc_len;
+    var rng: u64 = 0x9E3779B97F4A7C15;
+    for (trees) |tree| try tree.resize(alloc, n, .inactive);
+    const words = n >> 6;
+    var w: u32 = 0;
+    while (w < words) : (w += 1) {
+        for (trees) |tree| {
+            const hi = commonBenchRandU32(&rng);
+            const lo = commonBenchRandU32(&rng);
+            const pick = commonBenchRandU32(&rng);
+            const word: u64 = if ((w & 1) == 0)
+                (@as(u64, hi) << 32) | lo
+            else if ((pick & 1) == 1)
+                0
+            else
+                std.math.maxInt(u64);
+            tree.setWord(w, word, std.math.maxInt(u64));
+        }
+    }
+}
+
+/// Writes checkerboard words into every tree for deep summaries.
+/// - `trees` - scenario trees, includes first.
+/// - `inc_len` - leading include count, unused.
+/// - `alloc` - owns backing storage.
+/// - `n` - shared valid bits.
+fn fillChecker(trees: []*Tree, inc_len: u32, alloc: Allocator, n: u32) !void {
+    _ = inc_len;
+    for (trees) |tree| try tree.resize(alloc, n, .inactive);
+    const words = n >> 6;
+    var w: u32 = 0;
+    while (w < words) : (w += 1) {
+        for (trees) |tree| tree.setWord(w, 0xAAAAAAAAAAAAAAAA, std.math.maxInt(u64));
+    }
+}
+
+/// Fills the first half of every tree, leaves the second cleared.
+/// - `trees` - scenario trees, includes first.
+/// - `inc_len` - leading include count, unused.
+/// - `alloc` - owns backing storage.
+/// - `n` - shared valid bits.
+fn fillHalf(trees: []*Tree, inc_len: u32, alloc: Allocator, n: u32) !void {
+    _ = inc_len;
+    for (trees) |tree| try tree.resize(alloc, n, .inactive);
+    const words = n >> 6;
+    var w: u32 = 0;
+    while (w < words / 2) : (w += 1) {
+        for (trees) |tree| tree.setWord(w, std.math.maxInt(u64), std.math.maxInt(u64));
+    }
+}
+
+/// Writes disjoint active blocks per include, excludes cleared.
+/// - `trees` - scenario trees, includes first.
+/// - `inc_len` - leading include count.
+/// - `alloc` - owns backing storage.
+/// - `n` - shared valid bits.
+fn fillDisjoint(trees: []*Tree, inc_len: u32, alloc: Allocator, n: u32) !void {
+    for (trees) |tree| try tree.resize(alloc, n, .inactive);
+    const lane: u32 = 2000;
+    var k: u32 = 0;
+    while (k < inc_len) : (k += 1) {
+        var b: u32 = k * lane;
+        const end: u32 = @min(b + lane, n);
+        while (b < end) : (b += 1) trees[k].setBit(b, .active);
+    }
+}
+
+/// Writes alternating inactive-friendly lanes, even bits suit excludes.
+/// - `trees` - scenario trees, includes first.
+/// - `inc_len` - leading include count.
+/// - `alloc` - owns backing storage.
+/// - `n` - shared valid bits.
+fn fillCheckerInactive(trees: []*Tree, inc_len: u32, alloc: Allocator, n: u32) !void {
+    for (trees, 0..) |tree, k| {
+        try tree.resize(alloc, n, .inactive);
+        const words = n >> 6;
+        var w: u32 = 0;
+        while (w < words) : (w += 1) {
+            const word: u64 = if (k < inc_len) 0xAAAAAAAAAAAAAAAA else 0x5555555555555555;
+            tree.setWord(w, word, std.math.maxInt(u64));
+        }
+    }
+}
+
+/// Writes full includes with strided holes cleared in excludes.
+/// - `trees` - scenario trees, includes first.
+/// - `inc_len` - leading include count.
+/// - `alloc` - owns backing storage.
+/// - `n` - shared valid bits.
+fn fillHoles(trees: []*Tree, inc_len: u32, alloc: Allocator, n: u32) !void {
+    for (trees, 0..) |tree, k| {
+        try tree.resize(alloc, n, .active);
+        if (k >= inc_len) {
+            var b: u32 = 0;
+            while (b < n) : (b += 997) tree.setBit(b, .inactive);
+        }
+    }
+}
+
+/// Writes strided includes with fully set excludes vetoing everything.
+/// - `trees` - scenario trees, includes first.
+/// - `inc_len` - leading include count.
+/// - `alloc` - owns backing storage.
+/// - `n` - shared valid bits.
+fn fillVetoSparse(trees: []*Tree, inc_len: u32, alloc: Allocator, n: u32) !void {
+    for (trees, 0..) |tree, k| {
+        try tree.resize(alloc, n, .inactive);
+        if (k < inc_len) {
+            var b: u32 = 0;
+            while (b < n) : (b += 997) tree.setBit(b, .active);
+        } else {
+            var b: u32 = 0;
+            while (b < n) : (b += 1) tree.setBit(b, .active);
+        }
+    }
+}
+
+/// Writes random includes with fully set excludes vetoing everything.
+/// - `trees` - scenario trees, includes first.
+/// - `inc_len` - leading include count.
+/// - `alloc` - owns backing storage.
+/// - `n` - shared valid bits.
+fn fillVeto(trees: []*Tree, inc_len: u32, alloc: Allocator, n: u32) !void {
+    var rng: u64 = 0x123456789ABCDEF;
+    for (trees, 0..) |tree, k| {
+        if (k < inc_len) {
+            try tree.resize(alloc, n, .inactive);
+            const words = n >> 6;
+            var w: u32 = 0;
+            while (w < words) : (w += 1) {
+                const word: u64 = (@as(u64, commonBenchRandU32(&rng)) << 32) | commonBenchRandU32(&rng);
+                tree.setWord(w, word, std.math.maxInt(u64));
+            }
+        } else {
+            try tree.resize(alloc, n, .active);
+        }
+    }
+}
+
+/// Builds, fills and benchmarks one common scenario end to end.
+/// - `io` - clock source for timing.
+/// - `alloc` - owns trees.
+/// - `name` - scenario label, static storage.
+/// - `n` - shared valid bits.
+/// - `mode` - installed callback subset.
+/// - `fill` - scenario word distribution.
+///
+/// Return - medians with the auto choice and match flag.
+fn benchCommonBuilt(
+    comptime IL: u32,
+    comptime EL: u32,
+    comptime mode: CommonMode,
+    io: std.Io,
+    alloc: Allocator,
+    name: []const u8,
+    n: u32,
+    fill: fn ([]*Tree, u32, Allocator, u32) anyerror!void,
+) !CommonBenchResult {
+    var trees: [IL + EL]Tree = [_]Tree{.{}} ** (IL + EL);
+    defer {
+        for (0..IL + EL) |k| trees[k].deinit(alloc);
+    }
+    var ptrs: [IL + EL]*Tree = undefined;
+    for (0..IL + EL) |k| ptrs[k] = &trees[k];
+    const slice: []*Tree = &ptrs;
+    try fill(slice, IL, alloc, n);
+    var inc: [IL]*Tree = undefined;
+    var exc: [EL]*Tree = undefined;
+    for (0..IL) |k| inc[k] = &trees[k];
+    for (0..EL) |k| exc[k] = &trees[IL + k];
+    return benchCommonMode(IL, EL, mode, io, alloc, name, inc, exc, n);
+}
+
 /// Past timings for one scenario kept oldest-first for trends.
 const HistEntry = struct {
     /// Scenario label matching current row names.
@@ -619,84 +1093,169 @@ pub fn main(init: std.process.Init) !void {
     defer _ = gpa.deinit();
     const alloc: Allocator = gpa.allocator();
 
+    var arg_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
+    defer arg_it.deinit();
+    _ = arg_it.next();
+    const only: []const u8 = arg_it.next() orelse "all";
+    const run_classic = !std.mem.eql(u8, only, "common");
+    const run_common = !std.mem.eql(u8, only, "classic");
+
     var rows: std.ArrayListUnmanaged(Row) = .empty;
     defer {
         for (rows.items) |row| alloc.free(row.name);
         rows.deinit(alloc);
     }
 
-    var sparse = Oracle{};
-    defer sparse.deinit(alloc);
-    try sparse.resize(alloc, 1_000_000, .inactive);
-    fillStride(&sparse, 997, 1);
+    if (run_classic) {
+        var sparse = Oracle{};
+        defer sparse.deinit(alloc);
+        try sparse.resize(alloc, 1_000_000, .inactive);
+        fillStride(&sparse, 997, 1);
 
-    var dense = Oracle{};
-    defer dense.deinit(alloc);
-    try dense.resize(alloc, 100_000, .active);
+        var dense = Oracle{};
+        defer dense.deinit(alloc);
+        try dense.resize(alloc, 100_000, .active);
 
-    var strided = Oracle{};
-    defer strided.deinit(alloc);
-    try strided.resize(alloc, 200_000, .inactive);
-    fillStride(&strided, 3, 0);
+        var strided = Oracle{};
+        defer strided.deinit(alloc);
+        try strided.resize(alloc, 200_000, .inactive);
+        fillStride(&strided, 3, 0);
 
-    var ultra = Oracle{};
-    defer ultra.deinit(alloc);
-    try ultra.resize(alloc, 10_000_000, .inactive);
-    fillStride(&ultra, 100_003, 7);
+        var ultra = Oracle{};
+        defer ultra.deinit(alloc);
+        try ultra.resize(alloc, 10_000_000, .inactive);
+        fillStride(&ultra, 100_003, 7);
 
-    var sparse_tree = Tree{};
-    defer sparse_tree.deinit(alloc);
-    try sparse_tree.resize(alloc, 1_000_000, .inactive);
-    fillTreeStride(&sparse_tree, 997, 1);
+        var sparse_tree = Tree{};
+        defer sparse_tree.deinit(alloc);
+        try sparse_tree.resize(alloc, 1_000_000, .inactive);
+        fillTreeStride(&sparse_tree, 997, 1);
 
-    var dense_tree = Tree{};
-    defer dense_tree.deinit(alloc);
-    try dense_tree.resize(alloc, 100_000, .active);
+        var dense_tree = Tree{};
+        defer dense_tree.deinit(alloc);
+        try dense_tree.resize(alloc, 100_000, .active);
 
-    var strided_tree = Tree{};
-    defer strided_tree.deinit(alloc);
-    try strided_tree.resize(alloc, 200_000, .inactive);
-    fillTreeStride(&strided_tree, 3, 0);
+        var strided_tree = Tree{};
+        defer strided_tree.deinit(alloc);
+        try strided_tree.resize(alloc, 200_000, .inactive);
+        fillTreeStride(&strided_tree, 3, 0);
 
-    var ultra_tree = Tree{};
-    defer ultra_tree.deinit(alloc);
-    try ultra_tree.resize(alloc, 10_000_000, .inactive);
-    fillTreeStride(&ultra_tree, 100_003, 7);
+        var ultra_tree = Tree{};
+        defer ultra_tree.deinit(alloc);
+        try ultra_tree.resize(alloc, 10_000_000, .inactive);
+        fillTreeStride(&ultra_tree, 100_003, 7);
 
-    try benchOne(io, alloc, &rows, "sparse1M", &sparse, &sparse_tree, .active, 500);
-    try benchOne(io, alloc, &rows, "sparse1M-inactive", &sparse, &sparse_tree, .inactive, 5);
-    try benchOne(io, alloc, &rows, "dense100k", &dense, &dense_tree, .active, 20);
-    try benchOne(io, alloc, &rows, "every3rd200k", &strided, &strided_tree, .active, 20);
-    try benchOne(io, alloc, &rows, "ultra10M", &ultra, &ultra_tree, .active, 200);
+        try benchOne(io, alloc, &rows, "sparse1M", &sparse, &sparse_tree, .active, 500);
+        try benchOne(io, alloc, &rows, "sparse1M-inactive", &sparse, &sparse_tree, .inactive, 5);
+        try benchOne(io, alloc, &rows, "dense100k", &dense, &dense_tree, .active, 20);
+        try benchOne(io, alloc, &rows, "every3rd200k", &strided, &strided_tree, .active, 20);
+        try benchOne(io, alloc, &rows, "ultra10M", &ultra, &ultra_tree, .active, 200);
 
-    const strides = [_]u32{ 1, 2, 4, 8, 16, 64, 256, 1024, 4096, 16384, 65536 };
-    for ([_]u32{1_000_000}) |total| {
+        const strides = [_]u32{ 1, 2, 4, 8, 16, 64, 256, 1024, 4096, 16384, 65536 };
+        for ([_]u32{1_000_000}) |total| {
+            for (strides) |stride| {
+                try benchThreshold(io, alloc, &rows, total, stride, 100);
+            }
+        }
         for (strides) |stride| {
-            try benchThreshold(io, alloc, &rows, total, stride, 100);
+            try benchThreshold(io, alloc, &rows, 10_000_000, stride, 5);
         }
+
+        try benchCluster(io, alloc, &rows, 2_000_000, 1000, 1000, 20);
+        try benchCluster(io, alloc, &rows, 2_000_000, 1000, 10000, 20);
+        try benchCluster(io, alloc, &rows, 500_000, 50, 50, 50);
+        try benchCluster(io, alloc, &rows, 500_000, 50, 500, 50);
+
+        try benchFill(io, alloc, &rows, 1_000_000, 1, 0, 3);
+        try benchFill(io, alloc, &rows, 1_000_000, 997, 1, 5);
     }
-    for (strides) |stride| {
-        try benchThreshold(io, alloc, &rows, 10_000_000, stride, 5);
+
+    if (run_common) {
+        var common_results: std.ArrayListUnmanaged(CommonBenchResult) = .empty;
+        defer common_results.deinit(alloc);
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "uni-A-262k", 262144, fillUniA_UniI));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .inactive_only, io, alloc, "uni-I-262k", 262144, fillUniI_UniA));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "uni-I-Aonly-262k", 262144, fillUniI_UniA));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "sparse997-262k", 262144, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "single-bit-262k", 262144, fillSingleBit));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "alt-262k", 262144, fillAlternation));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .both, io, alloc, "alt-both-262k", 262144, fillAlternation));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "checker-262k", 262144, fillChecker));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "half-262k", 262144, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "veto-262k", 262144, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "veto-sparse-262k", 262144, fillVetoSparse));
+        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "holes-262k", 262144, fillHoles));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .inactive_only, io, alloc, "inact-heavy-262k", 262144, fillUniA_All));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "small130-alt", 130, fillAlternation));
+        try common_results.append(alloc, try benchCommonBuilt(3, 3, .active_only, io, alloc, "three-three-alt-262k", 262144, fillAlternation));
+        try common_results.append(alloc, try benchCommonBuilt(1, 0, .active_only, io, alloc, "one-zero-sparse-262k", 262144, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(1, 0, .active_only, io, alloc, "1x0-half-100k", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(0, 1, .active_only, io, alloc, "0x1-half-100k", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "1x1-half-100k", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-half-100k", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(1, 5, .active_only, io, alloc, "1x5-half-100k", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(5, 1, .active_only, io, alloc, "5x1-half-100k", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-half-100k", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(10, 0, .active_only, io, alloc, "10x0-half-100k", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(0, 10, .active_only, io, alloc, "0x10-half-100k", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(3, 7, .active_only, io, alloc, "3x7-half-100k", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-half-100k", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(1, 0, .active_only, io, alloc, "1x0-veto-100k", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(0, 1, .active_only, io, alloc, "0x1-veto-100k", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "1x1-veto-100k", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-veto-100k", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(1, 5, .active_only, io, alloc, "1x5-veto-100k", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(5, 1, .active_only, io, alloc, "5x1-veto-100k", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-veto-100k", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(10, 0, .active_only, io, alloc, "10x0-veto-100k", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(0, 10, .active_only, io, alloc, "0x10-veto-100k", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(3, 7, .active_only, io, alloc, "3x7-veto-100k", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-veto-100k", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(1, 0, .active_only, io, alloc, "1x0-sparse-100k", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(0, 1, .active_only, io, alloc, "0x1-sparse-100k", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "1x1-sparse-100k", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-sparse-100k", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(1, 5, .active_only, io, alloc, "1x5-sparse-100k", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(5, 1, .active_only, io, alloc, "5x1-sparse-100k", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-sparse-100k", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(10, 0, .active_only, io, alloc, "10x0-sparse-100k", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(0, 10, .active_only, io, alloc, "0x10-sparse-100k", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(3, 7, .active_only, io, alloc, "3x7-sparse-100k", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-sparse-100k", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-checker-100k", 100000, fillChecker));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-checker-100k", 100000, fillChecker));
+        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-checker-100k", 100000, fillChecker));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-disjoint-100k", 100000, fillDisjoint));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-disjoint-100k", 100000, fillDisjoint));
+        try common_results.append(alloc, try benchCommonBuilt(3, 7, .active_only, io, alloc, "3x7-disjoint-100k", 100000, fillDisjoint));
+        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-disjoint-100k", 100000, fillDisjoint));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-uni-A-100k", 100000, fillUniA_UniI));
+        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-uni-A-100k", 100000, fillUniA_UniI));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-single-100k", 100000, fillSingleBit));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-single-100k", 100000, fillSingleBit));
+        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "1x1-holes-100k", 100000, fillHoles));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-holes-100k", 100000, fillHoles));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-holes-100k", 100000, fillHoles));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .inactive_only, io, alloc, "2x2-half-I-100k", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .inactive_only, io, alloc, "5x5-half-I-100k", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .inactive_only, io, alloc, "2x2-checker-I-100k", 100000, fillCheckerInactive));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .both, io, alloc, "2x2-alt-both-100k", 100000, fillAlternation));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .both, io, alloc, "2x2-half-both-100k", 100000, fillHalf));
+        printCommonTable(common_results.items);
     }
 
-    try benchCluster(io, alloc, &rows, 2_000_000, 1000, 1000, 20);
-    try benchCluster(io, alloc, &rows, 2_000_000, 1000, 10000, 20);
-    try benchCluster(io, alloc, &rows, 500_000, 50, 50, 50);
-    try benchCluster(io, alloc, &rows, 500_000, 50, 500, 50);
-
-    try benchFill(io, alloc, &rows, 1_000_000, 1, 0, 3);
-    try benchFill(io, alloc, &rows, 1_000_000, 997, 1, 5);
-
-    var hists = loadHistory(io, alloc);
-    defer {
-        for (hists.items) |*h| {
-            alloc.free(h.name);
-            h.vals.deinit(alloc);
+    if (run_classic) {
+        var hists = loadHistory(io, alloc);
+        defer {
+            for (hists.items) |*h| {
+                alloc.free(h.name);
+                h.vals.deinit(alloc);
+            }
+            hists.deinit(alloc);
         }
-        hists.deinit(alloc);
+        printTable(rows.items, hists.items);
+        saveHistory(io, alloc, rows.items, hists.items) catch |err| {
+            std.debug.print("warn: cannot write {s}: {t}\n", .{ HISTORY_PATH, err });
+        };
     }
-    printTable(rows.items, hists.items);
-    saveHistory(io, alloc, rows.items, hists.items) catch |err| {
-        std.debug.print("warn: cannot write {s}: {t}\n", .{ HISTORY_PATH, err });
-    };
 }
