@@ -166,8 +166,8 @@ const SumCtx = struct {
 ///
 /// Return - pinned sums, counts and total nanoseconds.
 fn benchTree(io: std.Io, tree: *Tree, comptime want: BitState, reps: u32) struct { sum: u64, count: u64, ns: u64 } {
-    const It = Tree.Iterator(*SumCtx, SumCtx.addInline, null);
-    const ItI = Tree.Iterator(*SumCtx, null, SumCtx.addInline);
+    const It = Tree.Iterator(*SumCtx, SumCtx.addInline, null, .forward);
+    const ItI = Tree.Iterator(*SumCtx, null, SumCtx.addInline, .forward);
     const use_flat = if (want == .active) It.predictsFlat(tree) else ItI.predictsFlat(tree);
     bit_tree.last_predict_used_flat = use_flat;
     var watch = Stopwatch.start(io);
@@ -178,9 +178,9 @@ fn benchTree(io: std.Io, tree: *Tree, comptime want: BitState, reps: u32) struct
         while (r < reps) : (r += 1) {
             var c = SumCtx{};
             const done = if (want == .active)
-                It.iterateFlat(.{ .tree = tree, .context = &c })
+                It.iterateFlat(.{ .tree = tree, .context = &c }, null, null)
             else
-                ItI.iterateFlat(.{ .tree = tree, .context = &c });
+                ItI.iterateFlat(.{ .tree = tree, .context = &c }, null, null);
             std.mem.doNotOptimizeAway(done);
             sum += c.sum;
             count += c.count;
@@ -190,9 +190,9 @@ fn benchTree(io: std.Io, tree: *Tree, comptime want: BitState, reps: u32) struct
         while (r < reps) : (r += 1) {
             var c = SumCtx{};
             const done = if (want == .active)
-                It.iterateTree(.{ .tree = tree, .context = &c })
+                It.iterateTree(.{ .tree = tree, .context = &c }, null, null)
             else
-                ItI.iterateTree(.{ .tree = tree, .context = &c });
+                ItI.iterateTree(.{ .tree = tree, .context = &c }, null, null);
             std.mem.doNotOptimizeAway(done);
             sum += c.sum;
             count += c.count;
@@ -270,12 +270,12 @@ fn verifyTree(
     try got.ensureTotalCapacity(alloc, exp.items.len);
     {
         var vc = VerifyCtx{ .list = &got };
-        const It = Tree.Iterator(*VerifyCtx, VerifyCtx.push, null);
-        const ItI = Tree.Iterator(*VerifyCtx, null, VerifyCtx.push);
+        const It = Tree.Iterator(*VerifyCtx, VerifyCtx.push, null, .forward);
+        const ItI = Tree.Iterator(*VerifyCtx, null, VerifyCtx.push, .forward);
         if (want == .active) {
-            _ = It.iterateAll(.{ .tree = tree, .context = &vc });
+            _ = It.iterateAll(.{ .tree = tree, .context = &vc }, null, null);
         } else {
-            _ = ItI.iterateAll(.{ .tree = tree, .context = &vc });
+            _ = ItI.iterateAll(.{ .tree = tree, .context = &vc }, null, null);
         }
     }
     if (got.items.len != exp.items.len) {
@@ -319,12 +319,12 @@ fn benchOne(
     try verifyTree(alloc, oracle, tree, want, name);
     {
         var c = SumCtx{};
-        const It = Tree.Iterator(*SumCtx, SumCtx.addInline, null);
-        const ItI = Tree.Iterator(*SumCtx, null, SumCtx.addInline);
+        const It = Tree.Iterator(*SumCtx, SumCtx.addInline, null, .forward);
+        const ItI = Tree.Iterator(*SumCtx, null, SumCtx.addInline, .forward);
         const done = if (want == .active)
-            It.iterateAll(.{ .tree = tree, .context = &c })
+            It.iterateAll(.{ .tree = tree, .context = &c }, null, null)
         else
-            ItI.iterateAll(.{ .tree = tree, .context = &c });
+            ItI.iterateAll(.{ .tree = tree, .context = &c }, null, null);
         std.mem.doNotOptimizeAway(done);
     }
     const exp = oracleSumOnce(oracle, want);
@@ -533,12 +533,12 @@ fn verifyCommon(
     try vc.active.ensureTotalCapacity(alloc, exp_a.items.len);
     try vc.inactive.ensureTotalCapacity(alloc, exp_i.items.len);
     {
-        const It = Tree.CommonIterator(IL, EL, *CommonCtx, CommonCtx.pushA, CommonCtx.pushI);
+        const It = Tree.CommonIterator(IL, EL, *CommonCtx, CommonCtx.pushA, CommonCtx.pushI, .forward);
         _ = It.iterateAll(.{
             .includes = includes,
             .excludes = excludes,
             .context = &vc,
-        });
+        }, null, null);
     }
     if (!std.mem.eql(u32, vc.active.items, exp_a.items)) {
         std.debug.print("verify {s}: active set mismatch got={d} exp={d}\n", .{ name, vc.active.items.len, exp_a.items.len });
@@ -572,17 +572,17 @@ fn timeCommonArm(
 ) u64 {
     const on_a = if (mode == .inactive_only) null else CommonCtx.pushA;
     const on_i = if (mode == .active_only) null else CommonCtx.pushI;
-    const It = Tree.CommonIterator(IL, EL, *CommonCtx, on_a, on_i);
+    const It = Tree.CommonIterator(IL, EL, *CommonCtx, on_a, on_i, .forward);
     const data: Tree.TreesWithContext(IL, EL, *CommonCtx) = .{ .includes = includes, .excludes = excludes, .context = ctx };
     ctx.active.clearRetainingCapacity();
     ctx.inactive.clearRetainingCapacity();
     var watch = Stopwatch.start(io);
     if (arm == 0) {
-        _ = It.iterateFlat(data);
+        _ = It.iterateFlat(data, null, null);
     } else if (arm == 1) {
-        _ = It.iterateTree(data);
+        _ = It.iterateTree(data, null, null);
     } else {
-        _ = It.iterateAll(data);
+        _ = It.iterateAll(data, null, null);
     }
     const ns = watch.read();
     std.mem.doNotOptimizeAway(ctx.active.items.len + ctx.inactive.items.len);
@@ -634,7 +634,7 @@ fn benchCommonMode(
     try lists.inactive.ensureTotalCapacity(alloc, n);
     const on_a = if (mode == .inactive_only) null else CommonCtx.pushA;
     const on_i = if (mode == .active_only) null else CommonCtx.pushI;
-    const It = Tree.CommonIterator(IL, EL, *CommonCtx, on_a, on_i);
+    const It = Tree.CommonIterator(IL, EL, *CommonCtx, on_a, on_i, .forward);
     var ms: [3]f64 = undefined;
     var a: usize = 0;
     while (a < 3) : (a += 1) {

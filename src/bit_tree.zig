@@ -120,6 +120,7 @@ pub fn BitTree(comptime wt: WordType) type {
             comptime Context: type,
             comptime on_active: InlineIteratorCallback(Context),
             comptime on_inactive: InlineIteratorCallback(Context),
+            comptime direction: utilities.Direction,
         ) type {
             return struct {
                 /// Level cursor pairing a tree with the current depth.
@@ -128,6 +129,10 @@ pub fn BitTree(comptime wt: WordType) type {
                     layer_id: u32,
                     /// Caller context forwarded to per-bit callbacks.
                     context: Context,
+                    /// Resolved range start, inclusive, clips leaf visits.
+                    range_lo: u32,
+                    /// Resolved range end, exclusive, clips leaf visits.
+                    range_hi: u32,
                 });
 
                 /// Adapts a bit callback into a layer visitor over one word span.
@@ -147,15 +152,27 @@ pub fn BitTree(comptime wt: WordType) type {
                             const end_word_id = word_id + 1;
                             const shift: u32 = bw.shift_type_bits * layer_id;
                             const s5: u5 = @truncate(shift);
-                            const start_bit_id = word_id << s5;
-                            var end_bit_id = end_word_id << s5;
+                            const span_lo = word_id << s5;
+                            var span_hi = end_word_id << s5;
                             const total = data.tree.bitset.bits_count;
-                            if (end_bit_id > total) end_bit_id = total;
-                            if (start_bit_id >= total) return true;
+                            if (span_hi > total) span_hi = total;
+                            const start_bit_id = @max(span_lo, data.context.range_lo);
+                            const end_bit_id = @min(span_hi, data.context.range_hi);
+                            if (start_bit_id >= end_bit_id) return true;
 
-                            for (start_bit_id..end_bit_id) |i| {
-                                if (callback) |f| {
-                                    if (!f(context, @truncate(i))) return false;
+                            if (direction == .forward) {
+                                for (start_bit_id..end_bit_id) |i| {
+                                    if (callback) |f| {
+                                        if (!f(context, @truncate(i))) return false;
+                                    }
+                                }
+                            } else {
+                                var i: u32 = end_bit_id;
+                                while (i > start_bit_id) {
+                                    i -= 1;
+                                    if (callback) |f| {
+                                        if (!f(context, i)) return false;
+                                    }
                                 }
                             }
                             return true;
@@ -176,17 +193,23 @@ pub fn BitTree(comptime wt: WordType) type {
                     if (on_active != null) active_unwrapper else null,
                     mixed_unwrapper,
                     deep_mixed_unwrapper,
+                    direction,
                 );
+
+                /// Leaf visitor shared by the tree walk for direct word scans.
+                const BI = B.Iterator(Context, on_active, on_inactive, direction);
 
                 /// Runs the predicted path and records the choice for inspection.
                 /// - `data` - tree and caller context.
+                /// - `start_bit` - range edge or null for no lower limit.
+                /// - `end_bit` - range edge or null for no upper limit.
                 ///
                 /// Return - false on early exit, true when the scan completed.
-                pub fn iterateAll(data: TreeWithContext(Context)) bool {
+                pub fn iterateAll(data: TreeWithContext(Context), start_bit: ?u32, end_bit: ?u32) bool {
                     const use_flat = predictsFlat(data.tree);
                     last_predict_used_flat = use_flat;
-                    if (use_flat) return iterateFlat(data);
-                    return iterateTree(data);
+                    if (use_flat) return iterateFlat(data, start_bit, end_bit);
+                    return iterateTree(data, start_bit, end_bit);
                 }
 
                 /// Predicts whether a flat scan beats pyramid descent.
@@ -244,34 +267,58 @@ pub fn BitTree(comptime wt: WordType) type {
 
                 /// Scans leaves directly without touching summaries.
                 /// - `data` - tree and caller context.
+                /// - `start_bit` - range edge or null for no lower limit.
+                /// - `end_bit` - range edge or null for no upper limit.
                 ///
                 /// Return - false on early exit, true when the scan completed.
-                pub fn iterateFlat(data: TreeWithContext(Context)) bool {
-                    const BI = B.Iterator(Context, on_active, on_inactive);
-                    return BI.iterateAll(.{ .bitset = &data.tree.bitset, .context = data.context });
+                pub fn iterateFlat(data: TreeWithContext(Context), start_bit: ?u32, end_bit: ?u32) bool {
+                    return BI.iterateAll(.{ .bitset = &data.tree.bitset, .context = data.context }, start_bit, end_bit);
                 }
 
                 /// Walks the pyramid from the top word down to leaves.
                 /// - `data` - tree and caller context.
+                /// - `start_bit` - range edge or null for no lower limit.
+                /// - `end_bit` - range edge or null for no upper limit.
                 ///
                 /// Return - false on early exit, true when the walk completed.
-                pub inline fn iterateTree(data: TreeWithContext(Context)) bool {
+                pub inline fn iterateTree(data: TreeWithContext(Context), start_bit: ?u32, end_bit: ?u32) bool {
                     const layers = data.tree.layers.items;
                     if (layers.len == 0) return true;
+                    const range = utilities.resolveRange(data.tree.bitset.bits_count, start_bit, end_bit);
+                    if (range.lo >= range.hi) return true;
                     const layer_id = layers.len - 1;
                     var context: LayerWithContext = .{
                         .context = .{
                             .context = data.context,
                             .layer_id = @truncate(layer_id),
+                            .range_lo = range.lo,
+                            .range_hi = range.hi,
                         },
                         .tree = data.tree,
                     };
 
                     const top = &data.tree.layers.items[layer_id];
+                    const shift_top: u32 = bw.shift_type_bits * @as(u32, @truncate(layer_id));
+                    const s_top: u5 = @truncate(shift_top);
                     const words: u32 = @truncate(top.activity.items.len);
-                    var wid: u32 = 0;
-                    while (wid < words) : (wid += 1) {
-                        if (!LI.step(.{ .layer = top, .context = &context }, wid)) return false;
+                    const w_lo: u32 = range.lo >> s_top;
+                    var w_hi: u32 = (range.hi - 1) >> s_top;
+                    if (w_hi >= words) w_hi = words - 1;
+                    if (w_lo > w_hi) return true;
+                    if (direction == .forward) {
+                        var wid: u32 = w_lo;
+                        while (true) {
+                            if (!LI.step(.{ .layer = top, .context = &context }, wid)) return false;
+                            if (wid == w_hi) break;
+                            wid += 1;
+                        }
+                    } else {
+                        var wid: u32 = w_hi;
+                        while (true) {
+                            if (!LI.step(.{ .layer = top, .context = &context }, wid)) return false;
+                            if (wid == w_lo) break;
+                            wid -= 1;
+                        }
                     }
 
                     return true;
@@ -301,19 +348,43 @@ pub fn BitTree(comptime wt: WordType) type {
                     const end_word_id = word_id + 1;
                     const shift: u32 = bw.shift_type_bits * (layer_id - 1);
                     const s5: u5 = @truncate(shift);
-                    const start_bit_id = word_id << s5;
-                    var end_bit_id = end_word_id << s5;
+                    const span_lo = word_id << s5;
+                    var span_hi = end_word_id << s5;
                     const words_len: u32 = @truncate(data.tree.bitset.words.items.len);
-                    if (end_bit_id > words_len) end_bit_id = words_len;
-                    if (start_bit_id >= words_len) return true;
+                    if (span_hi > words_len) span_hi = words_len;
+                    const lo: u32 = @intCast(@max(span_lo, bw.bitToWordId(data.context.range_lo)));
+                    const hi: u32 = @intCast(@min(span_hi, bw.bitToWordId(data.context.range_hi - 1) + 1));
+                    if (lo >= hi or lo >= words_len) return true;
 
-                    const BI = B.Iterator(Context, on_active, on_inactive);
                     const bi_data: B.BitsetWithContext(Context) = .{
                         .bitset = &data.tree.bitset,
                         .context = data.context.context,
                     };
-                    for (start_bit_id..end_bit_id) |i| {
-                        if (!BI.step(bi_data, @truncate(i))) return false;
+                    const r_lo = data.context.range_lo;
+                    const r_hi = data.context.range_hi;
+                    if (direction == .forward) {
+                        var i: u32 = lo;
+                        while (true) {
+                            const w_base = bw.wordToBitId(i);
+                            if (w_base >= r_lo and w_base + bw.word_type_bits <= r_hi) {
+                                if (!BI.step(bi_data, i)) return false;
+                            } else {
+                                if (!BI.iterateAll(bi_data, @max(r_lo, w_base), @min(r_hi, w_base + bw.word_type_bits))) return false;
+                            }
+                            if (i + 1 == hi) break;
+                            i += 1;
+                        }
+                    } else {
+                        var i: u32 = hi;
+                        while (i > lo) {
+                            i -= 1;
+                            const w_base = bw.wordToBitId(i);
+                            if (w_base >= r_lo and w_base + bw.word_type_bits <= r_hi) {
+                                if (!BI.step(bi_data, i)) return false;
+                            } else {
+                                if (!BI.iterateAll(bi_data, @max(r_lo, w_base), @min(r_hi, w_base + bw.word_type_bits))) return false;
+                            }
+                        }
                     }
                     return true;
                 }
@@ -332,6 +403,7 @@ pub fn BitTree(comptime wt: WordType) type {
             comptime Context: type,
             comptime on_active: InlineIteratorCallback(Context),
             comptime on_inactive: InlineIteratorCallback(Context),
+            comptime direction: utilities.Direction,
         ) type {
             return struct {
                 /// Level cursor pairing trees with the current depth.
@@ -340,6 +412,10 @@ pub fn BitTree(comptime wt: WordType) type {
                     layer_id: u32,
                     /// Caller context forwarded to per-bit callbacks.
                     context: Context,
+                    /// Resolved range start, inclusive, clips leaf visits.
+                    range_lo: u32,
+                    /// Resolved range end, exclusive, clips leaf visits.
+                    range_hi: u32,
                 });
 
                 /// Adapts a bit callback into a layer visitor over one word span.
@@ -360,15 +436,27 @@ pub fn BitTree(comptime wt: WordType) type {
                             const end_word_id = word_id + 1;
                             const shift: u32 = bw.shift_type_bits * layer_id;
                             const s5: u5 = @truncate(shift);
-                            const start_bit_id = word_id << s5;
-                            var end_bit_id = end_word_id << s5;
+                            const span_lo = word_id << s5;
+                            var span_hi = end_word_id << s5;
                             const total = first.bitset.bits_count;
-                            if (end_bit_id > total) end_bit_id = total;
-                            if (start_bit_id >= total) return true;
+                            if (span_hi > total) span_hi = total;
+                            const start_bit_id = @max(span_lo, data.context.range_lo);
+                            const end_bit_id = @min(span_hi, data.context.range_hi);
+                            if (start_bit_id >= end_bit_id) return true;
 
-                            for (start_bit_id..end_bit_id) |i| {
-                                if (callback) |f| {
-                                    if (!f(context, @truncate(i))) return false;
+                            if (direction == .forward) {
+                                for (start_bit_id..end_bit_id) |i| {
+                                    if (callback) |f| {
+                                        if (!f(context, @truncate(i))) return false;
+                                    }
+                                }
+                            } else {
+                                var i: u32 = end_bit_id;
+                                while (i > start_bit_id) {
+                                    i -= 1;
+                                    if (callback) |f| {
+                                        if (!f(context, i)) return false;
+                                    }
                                 }
                             }
                             return true;
@@ -376,16 +464,21 @@ pub fn BitTree(comptime wt: WordType) type {
                     };
                 }
 
+                /// Leaf visitor shared by the tree walk for direct word scans.
+                const BI = B.CommonIterator(include_len, exclude_len, Context, on_active, on_inactive, direction);
+
                 /// Runs the predicted path and records the choice for inspection.
                 /// - `data` - trees and caller context.
+                /// - `start_bit` - range edge or null for no lower limit.
+                /// - `end_bit` - range edge or null for no upper limit.
                 ///
                 /// Return - false on early exit, true when the scan completed.
-                pub fn iterateAll(data: TreesWithContext(include_len, exclude_len, Context)) bool {
+                pub fn iterateAll(data: TreesWithContext(include_len, exclude_len, Context), start_bit: ?u32, end_bit: ?u32) bool {
                     if (include_len == 0 and exclude_len == 0) return true;
                     const use_flat = predictsFlat(data.includes, data.excludes);
                     last_predict_used_flat = use_flat;
-                    if (use_flat) return iterateFlat(data);
-                    return iterateTree(data);
+                    if (use_flat) return iterateFlat(data, start_bit, end_bit);
+                    return iterateTree(data, start_bit, end_bit);
                 }
 
                 /// Predicts whether a flat scan beats pyramid descent.
@@ -414,10 +507,11 @@ pub fn BitTree(comptime wt: WordType) type {
 
                 /// Scans leaves directly without touching summaries.
                 /// - `data` - trees and caller context.
+                /// - `start_bit` - range edge or null for no lower limit.
+                /// - `end_bit` - range edge or null for no upper limit.
                 ///
                 /// Return - false on early exit, true when the scan completed.
-                pub fn iterateFlat(data: TreesWithContext(include_len, exclude_len, Context)) bool {
-                    const BI = B.CommonIterator(include_len, exclude_len, Context, on_active, on_inactive);
+                pub fn iterateFlat(data: TreesWithContext(include_len, exclude_len, Context), start_bit: ?u32, end_bit: ?u32) bool {
                     var inc_sets: [include_len]*B = undefined;
                     var exc_sets: [exclude_len]*B = undefined;
                     inline for (0..include_len) |k| {
@@ -431,17 +525,21 @@ pub fn BitTree(comptime wt: WordType) type {
                         .excludes = exc_sets,
                         .context = data.context,
                     };
-                    return BI.iterateAll(bi_data);
+                    return BI.iterateAll(bi_data, start_bit, end_bit);
                 }
 
                 /// Walks the pyramids from the top word down to leaves.
                 /// - `data` - trees and caller context.
+                /// - `start_bit` - range edge or null for no lower limit.
+                /// - `end_bit` - range edge or null for no upper limit.
                 ///
                 /// Return - false on early exit, true when the walk completed.
-                pub inline fn iterateTree(data: TreesWithContext(include_len, exclude_len, Context)) bool {
+                pub inline fn iterateTree(data: TreesWithContext(include_len, exclude_len, Context), start_bit: ?u32, end_bit: ?u32) bool {
                     const first = if (include_len > 0) data.includes[0] else data.excludes[0];
                     const layers = first.layers.items;
                     if (layers.len == 0) return true;
+                    const range = utilities.resolveRange(first.bitset.bits_count, start_bit, end_bit);
+                    if (range.lo >= range.hi) return true;
                     const layer_id = layers.len - 1;
                     var inc_layers: [include_len]*L = undefined;
                     var exc_layers: [exclude_len]*L = undefined;
@@ -457,13 +555,32 @@ pub fn BitTree(comptime wt: WordType) type {
                         .context = .{
                             .context = data.context,
                             .layer_id = @truncate(layer_id),
+                            .range_lo = range.lo,
+                            .range_hi = range.hi,
                         },
                     };
 
                     const top_words: u32 = @truncate(layers[layer_id].activity.items.len);
-                    var wid: u32 = 0;
-                    while (wid < top_words) : (wid += 1) {
-                        if (!LI.step(.{ .includes = inc_layers, .excludes = exc_layers, .context = &context }, wid)) return false;
+                    const shift_top: u32 = bw.shift_type_bits * @as(u32, @truncate(layer_id));
+                    const s_top: u5 = @truncate(shift_top);
+                    const w_lo: u32 = range.lo >> s_top;
+                    var w_hi: u32 = (range.hi - 1) >> s_top;
+                    if (w_hi >= top_words) w_hi = top_words - 1;
+                    if (w_lo > w_hi or top_words == 0) return true;
+                    if (direction == .forward) {
+                        var wid: u32 = w_lo;
+                        while (true) {
+                            if (!LI.step(.{ .includes = inc_layers, .excludes = exc_layers, .context = &context }, wid)) return false;
+                            if (wid == w_hi) break;
+                            wid += 1;
+                        }
+                    } else {
+                        var wid: u32 = w_hi;
+                        while (true) {
+                            if (!LI.step(.{ .includes = inc_layers, .excludes = exc_layers, .context = &context }, wid)) return false;
+                            if (wid == w_lo) break;
+                            wid -= 1;
+                        }
                     }
 
                     return true;
@@ -484,6 +601,7 @@ pub fn BitTree(comptime wt: WordType) type {
                     if (on_active != null) active_unwrapper else null,
                     mixed_unwrapper,
                     deep_mixed_unwrapper,
+                    direction,
                 );
 
                 /// Upper bounds common hits from active counters without word reads.
@@ -688,14 +806,15 @@ pub fn BitTree(comptime wt: WordType) type {
                     const end_word_id = word_id + 1;
                     const shift: u32 = bw.shift_type_bits * (layer_id - 1);
                     const s5: u5 = @truncate(shift);
-                    const start_bit_id = word_id << s5;
-                    var end_bit_id = end_word_id << s5;
+                    const span_lo = word_id << s5;
+                    var span_hi = end_word_id << s5;
                     const first = if (include_len > 0) data.includes[0] else data.excludes[0];
                     const words_len: u32 = @truncate(first.bitset.words.items.len);
-                    if (end_bit_id > words_len) end_bit_id = words_len;
-                    if (start_bit_id >= words_len) return true;
+                    if (span_hi > words_len) span_hi = words_len;
+                    const lo: u32 = @intCast(@max(span_lo, bw.bitToWordId(data.context.range_lo)));
+                    const hi: u32 = @intCast(@min(span_hi, bw.bitToWordId(data.context.range_hi - 1) + 1));
+                    if (lo >= hi or lo >= words_len) return true;
 
-                    const BI = B.CommonIterator(include_len, exclude_len, Context, on_active, on_inactive);
                     var inc_sets: [include_len]*B = undefined;
                     var exc_sets: [exclude_len]*B = undefined;
                     inline for (0..include_len) |k| {
@@ -709,8 +828,31 @@ pub fn BitTree(comptime wt: WordType) type {
                         .excludes = exc_sets,
                         .context = data.context.context,
                     };
-                    for (start_bit_id..end_bit_id) |i| {
-                        if (!BI.step(bi_data, @truncate(i))) return false;
+                    const r_lo = data.context.range_lo;
+                    const r_hi = data.context.range_hi;
+                    if (direction == .forward) {
+                        var i: u32 = lo;
+                        while (true) {
+                            const w_base = bw.wordToBitId(i);
+                            if (w_base >= r_lo and w_base + bw.word_type_bits <= r_hi) {
+                                if (!BI.step(bi_data, i)) return false;
+                            } else {
+                                if (!BI.iterateAll(bi_data, @max(r_lo, w_base), @min(r_hi, w_base + bw.word_type_bits))) return false;
+                            }
+                            if (i + 1 == hi) break;
+                            i += 1;
+                        }
+                    } else {
+                        var i: u32 = hi;
+                        while (i > lo) {
+                            i -= 1;
+                            const w_base = bw.wordToBitId(i);
+                            if (w_base >= r_lo and w_base + bw.word_type_bits <= r_hi) {
+                                if (!BI.step(bi_data, i)) return false;
+                            } else {
+                                if (!BI.iterateAll(bi_data, @max(r_lo, w_base), @min(r_hi, w_base + bw.word_type_bits))) return false;
+                            }
+                        }
                     }
                     return true;
                 }
@@ -872,8 +1014,8 @@ inline fn treePushI(ctx: *TreeStepIds, bit_id: u32) bool {
 }
 
 fn treeStepCollectAll(comptime wt: WordType, tree: *BitTree(wt), ctx: *TreeStepIds) void {
-    const It = BitTree(wt).Iterator(*TreeStepIds, treePushA, treePushI);
-    _ = It.iterateAll(.{ .tree = tree, .context = ctx });
+    const It = BitTree(wt).Iterator(*TreeStepIds, treePushA, treePushI, .forward);
+    _ = It.iterateAll(.{ .tree = tree, .context = ctx }, null, null);
 }
 
 fn treeOracleIds(comptime wt: WordType, tree: *const BitTree(wt), target: BitState, out: *[512]u32) usize {
@@ -1081,9 +1223,9 @@ test "BitTree step: early exit" {
         var tree = BitTree(.u64){};
         defer tree.deinit(t.allocator);
         try tree.resize(t.allocator, 70, .active);
-        const It = BitTree(.u64).Iterator(*TreeStepIds, treePushA, treePushI);
+        const It = BitTree(.u64).Iterator(*TreeStepIds, treePushA, treePushI, .forward);
         var ctx = TreeStepIds{ .stop_after = 3 };
-        _ = It.iterateAll(.{ .tree = &tree, .context = &ctx });
+        _ = It.iterateAll(.{ .tree = &tree, .context = &ctx }, null, null);
         try t.expectEqual(@as(usize, 3), ctx.na + ctx.ni);
         var seen: [70]bool = [_]bool{false} ** 70;
         for (ctx.active[0..ctx.na]) |id| {
@@ -1102,9 +1244,9 @@ test "BitTree step: early exit" {
         defer tree.deinit(t.allocator);
         try tree.resize(t.allocator, 130, .inactive);
         tree.setBit(100, .active);
-        const It = BitTree(.u64).Iterator(*TreeStepIds, treePushA, treePushI);
+        const It = BitTree(.u64).Iterator(*TreeStepIds, treePushA, treePushI, .forward);
         var ctx = TreeStepIds{ .stop_after = 65 };
-        _ = It.iterateAll(.{ .tree = &tree, .context = &ctx });
+        _ = It.iterateAll(.{ .tree = &tree, .context = &ctx }, null, null);
         try t.expectEqual(@as(usize, 65), ctx.na + ctx.ni);
         var seen: [130]bool = [_]bool{false} ** 130;
         for (ctx.active[0..ctx.na]) |id| {
@@ -1124,9 +1266,9 @@ test "BitTree step: early exit" {
         var tree = BitTree(.u64){};
         defer tree.deinit(t.allocator);
         try tree.resize(t.allocator, 10, .inactive);
-        const It2 = BitTree(.u64).Iterator(*TreeStepIds, treePushA, treePushI);
+        const It2 = BitTree(.u64).Iterator(*TreeStepIds, treePushA, treePushI, .forward);
         var ctx = TreeStepIds{ .stop_after = 1 };
-        _ = It2.iterateAll(.{ .tree = &tree, .context = &ctx });
+        _ = It2.iterateAll(.{ .tree = &tree, .context = &ctx }, null, null);
         try t.expectEqual(@as(usize, 1), ctx.ni + ctx.na);
         const only = if (ctx.na == 1) ctx.active[0] else ctx.inactive[0];
         try t.expect(only < 10);
@@ -1139,9 +1281,9 @@ test "BitTree step: null side skips opposite uniform regions" {
         defer tree.deinit(t.allocator);
         try tree.resize(t.allocator, 130, .inactive);
         tree.setBit(100, .active);
-        const It = BitTree(.u64).Iterator(*TreeStepIds, treePushA, null);
+        const It = BitTree(.u64).Iterator(*TreeStepIds, treePushA, null, .forward);
         var ctx = TreeStepIds{};
-        _ = It.iterateAll(.{ .tree = &tree, .context = &ctx });
+        _ = It.iterateAll(.{ .tree = &tree, .context = &ctx }, null, null);
         try t.expectEqualSlices(u32, &[_]u32{100}, ctx.active[0..ctx.na]);
         try t.expectEqual(@as(usize, 0), ctx.ni);
     }
@@ -1150,9 +1292,9 @@ test "BitTree step: null side skips opposite uniform regions" {
         defer tree.deinit(t.allocator);
         try tree.resize(t.allocator, 130, .inactive);
         tree.setBit(100, .active);
-        const It = BitTree(.u64).Iterator(*TreeStepIds, null, treePushI);
+        const It = BitTree(.u64).Iterator(*TreeStepIds, null, treePushI, .forward);
         var ctx = TreeStepIds{};
-        _ = It.iterateAll(.{ .tree = &tree, .context = &ctx });
+        _ = It.iterateAll(.{ .tree = &tree, .context = &ctx }, null, null);
         try t.expectEqual(@as(usize, 129), ctx.ni);
         try t.expectEqual(@as(usize, 0), ctx.na);
         std.mem.sort(u32, ctx.inactive[0..ctx.ni], {}, std.sort.asc(u32));
@@ -1223,8 +1365,8 @@ inline fn totalPushI(ctx: *StepTotals, bit_id: u32) bool {
 }
 
 fn treeStepTotals(comptime wt: WordType, tree: *BitTree(wt), ctx: *StepTotals) void {
-    const It = BitTree(wt).Iterator(*StepTotals, totalPushA, totalPushI);
-    _ = It.iterateAll(.{ .tree = tree, .context = ctx });
+    const It = BitTree(wt).Iterator(*StepTotals, totalPushA, totalPushI, .forward);
+    _ = It.iterateAll(.{ .tree = tree, .context = ctx }, null, null);
 }
 
 fn treeOracleTotals(comptime wt: WordType, tree: *const BitTree(wt)) [2]u64 {
@@ -1410,8 +1552,8 @@ fn orderDebugCheckOne(comptime wt: WordType, n: u32, active_every: u32, active_o
     }
 
     var ctx = OrderDebugIds{};
-    const It = BitTree(wt).Iterator(*OrderDebugIds, orderDebugPushA, orderDebugPushI);
-    _ = It.iterateAll(.{ .tree = &tree, .context = &ctx });
+    const It = BitTree(wt).Iterator(*OrderDebugIds, orderDebugPushA, orderDebugPushI, .forward);
+    _ = It.iterateAll(.{ .tree = &tree, .context = &ctx }, null, null);
 
     if (!orderDebugIsSorted(&ctx)) {
         const v = orderDebugFirstViolation(&ctx);
@@ -1497,11 +1639,11 @@ test "BitTree predict: auto/flat/tree parity vs oracle" {
 }
 
 fn treeHoistedCollectAll(comptime wt: WordType, tree: *BitTree(wt), ctx: *TreeStepIds) void {
-    const It = BitTree(wt).Iterator(*TreeStepIds, treePushA, treePushI);
+    const It = BitTree(wt).Iterator(*TreeStepIds, treePushA, treePushI, .forward);
     if (It.predictsFlat(tree)) {
-        _ = It.iterateFlat(.{ .tree = tree, .context = ctx });
+        _ = It.iterateFlat(.{ .tree = tree, .context = ctx }, null, null);
     } else {
-        _ = It.iterateTree(.{ .tree = tree, .context = ctx });
+        _ = It.iterateTree(.{ .tree = tree, .context = ctx }, null, null);
     }
 }
 
@@ -1646,17 +1788,17 @@ test "BitTree CommonIterator cross: summary layer vs bitset 262144" {
     defer bctx.inactive.deinit(bctx.alloc);
     try bctx.active.ensureTotalCapacity(bctx.alloc, N);
     try bctx.inactive.ensureTotalCapacity(bctx.alloc, N);
-    const BI = Bitset(.u64).CommonIterator(2, 2, *CrossIds, crossPushA, crossPushI);
+    const BI = Bitset(.u64).CommonIterator(2, 2, *CrossIds, crossPushA, crossPushI, .forward);
     try t.expect(BI.iterateAll(.{
         .includes = .{ &trees[0].bitset, &trees[1].bitset },
         .excludes = .{ &trees[2].bitset, &trees[3].bitset },
         .context = &bctx,
-    }));
+    }, null, null));
 
     // Phase 2: walk the layers lockstep with the phase 1 lists. Every
     // visited active/inactive position must open a full 64-bit run.
     var lock = CrossLock{ .active = bctx.active.items, .inactive = bctx.inactive.items };
-    const LI = Layer(.u64).CommonIterator(2, 2, *CrossLock, crossLockPushI, crossLockPushA, crossLockPushM, crossLockPushD);
+    const LI = Layer(.u64).CommonIterator(2, 2, *CrossLock, crossLockPushI, crossLockPushA, crossLockPushM, crossLockPushD, .forward);
     const ldata: Layer(.u64).LayersWithContext(2, 2, *CrossLock) = .{
         .includes = .{ sum0, sum1 },
         .excludes = .{ sum2, sum3 },
@@ -1704,8 +1846,8 @@ fn commonTreeCollectAll(
     excludes: [EL]*BitTree(wt),
     ctx: *TreeStepIds,
 ) bool {
-    const It = BitTree(wt).CommonIterator(IL, EL, *TreeStepIds, on_a, on_i);
-    return It.iterateAll(.{ .includes = includes, .excludes = excludes, .context = ctx });
+    const It = BitTree(wt).CommonIterator(IL, EL, *TreeStepIds, on_a, on_i, .forward);
+    return It.iterateAll(.{ .includes = includes, .excludes = excludes, .context = ctx }, null, null);
 }
 
 fn commonTreeOracleIds(
@@ -1775,7 +1917,7 @@ fn commonTreeCheckOne(
     const exp = commonTreeOracleIds(wt, IL, EL, inc_ptrs, exc_ptrs, n, &exp_a, &exp_i);
 
     {
-        const It = BitTree(wt).CommonIterator(IL, EL, *TreeStepIds, treePushA, treePushI);
+        const It = BitTree(wt).CommonIterator(IL, EL, *TreeStepIds, treePushA, treePushI, .forward);
         var ctx = TreeStepIds{};
         try t.expect(commonTreeCollectAll(wt, IL, EL, treePushA, treePushI, inc_ptrs, exc_ptrs, &ctx));
         try t.expectEqualSlices(u32, exp_a[0..exp.na], ctx.active[0..ctx.na]);
@@ -1783,13 +1925,13 @@ fn commonTreeCheckOne(
         try t.expectEqual(last_predict_used_flat, It.predictsFlat(inc_ptrs, exc_ptrs));
     }
     {
-        const It = BitTree(wt).CommonIterator(IL, EL, *TreeStepIds, treePushA, treePushI);
+        const It = BitTree(wt).CommonIterator(IL, EL, *TreeStepIds, treePushA, treePushI, .forward);
         var fa = TreeStepIds{};
-        try t.expect(It.iterateFlat(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &fa }));
+        try t.expect(It.iterateFlat(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &fa }, null, null));
         try t.expectEqualSlices(u32, exp_a[0..exp.na], fa.active[0..fa.na]);
         try t.expectEqualSlices(u32, exp_i[0..exp.ni], fa.inactive[0..fa.ni]);
         var ta = TreeStepIds{};
-        try t.expect(It.iterateTree(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ta }));
+        try t.expect(It.iterateTree(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ta }, null, null));
         try t.expectEqualSlices(u32, exp_a[0..exp.na], ta.active[0..ta.na]);
         try t.expectEqualSlices(u32, exp_i[0..exp.ni], ta.inactive[0..ta.ni]);
     }
@@ -2011,9 +2153,9 @@ test "BitTree CommonIterator: early exit stops the walk" {
         var exc = try initCommonTree(.u64, 70, .zero);
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
-        const It = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, treePushI);
+        const It = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, treePushI, .forward);
         var ctx = TreeStepIds{ .stop_after = 3 };
-        try t.expect(!It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }));
+        try t.expect(!It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, null, null));
         try t.expectEqual(@as(usize, 3), ctx.na);
         try t.expectEqual(@as(usize, 0), ctx.ni);
         try t.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, ctx.active[0..ctx.na]);
@@ -2023,9 +2165,9 @@ test "BitTree CommonIterator: early exit stops the walk" {
         var exc = try initCommonTree(.u64, 130, .zero);
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
-        const It = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, treePushI);
+        const It = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, treePushI, .forward);
         var ctx = TreeStepIds{ .stop_after = 70 };
-        try t.expect(!It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }));
+        try t.expect(!It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, null, null));
         try t.expectEqual(@as(usize, 70), ctx.na);
         try t.expectEqual(@as(u32, 69), ctx.active[69]);
     }
@@ -2036,9 +2178,9 @@ test "BitTree CommonIterator: early exit stops the walk" {
         defer exc.deinit(t.allocator);
         inc.setBit(0, .active);
         exc.setBit(5, .active);
-        const It = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, treePushI);
+        const It = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, treePushI, .forward);
         var ctx = TreeStepIds{ .stop_after = 2 };
-        try t.expect(!It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }));
+        try t.expect(!It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, null, null));
         try t.expectEqualSlices(u32, &[_]u32{0}, ctx.active[0..ctx.na]);
         try t.expectEqualSlices(u32, &[_]u32{5}, ctx.inactive[0..ctx.ni]);
     }
@@ -2047,9 +2189,9 @@ test "BitTree CommonIterator: early exit stops the walk" {
         var exc = try initCommonTree(.u64, 10, .zero);
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
-        const It = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, treePushI);
+        const It = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, treePushI, .forward);
         var ctx = TreeStepIds{ .stop_after = 50 };
-        try t.expect(It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }));
+        try t.expect(It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, null, null));
         try t.expectEqual(@as(usize, 10), ctx.na);
     }
 }
@@ -2069,9 +2211,9 @@ test "BitTree CommonIterator: empty sets and zero lens" {
         try t.expectEqual(@as(usize, 0), ctx.total());
     }
     {
-        const It00 = BitTree(.u64).CommonIterator(0, 0, *TreeStepIds, treePushA, treePushI);
+        const It00 = BitTree(.u64).CommonIterator(0, 0, *TreeStepIds, treePushA, treePushI, .forward);
         var ctx = TreeStepIds{};
-        try t.expect(It00.iterateAll(.{ .includes = .{}, .excludes = .{}, .context = &ctx }));
+        try t.expect(It00.iterateAll(.{ .includes = .{}, .excludes = .{}, .context = &ctx }, null, null));
         try t.expect(It00.predictsFlat(.{}, .{}));
         try t.expectEqual(@as(usize, 0), ctx.total());
     }
@@ -2087,7 +2229,7 @@ test "BitTree CommonIterator: empty sets and zero lens" {
 }
 
 test "BitTree CommonIterator: prunable picks tree" {
-    const ItA = BitTree(.u64).CommonIterator(2, 2, *TreeStepIds, treePushA, null);
+    const ItA = BitTree(.u64).CommonIterator(2, 2, *TreeStepIds, treePushA, null, .forward);
     {
         var sets: [4]BitTree(.u64) = .{ .{}, .{}, .{}, .{} };
         defer {
@@ -2121,7 +2263,7 @@ test "BitTree CommonIterator: prunable picks tree" {
         var exc = try initCommonTree(.u64, 70, .zero);
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
-        const It1 = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, null);
+        const It1 = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, null, .forward);
         try t.expect(!It1.predictsFlat(.{&inc}, .{&exc}));
     }
     {
@@ -2129,7 +2271,7 @@ test "BitTree CommonIterator: prunable picks tree" {
         var exc = try initCommonTree(.u64, 200, .one);
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
-        const It1 = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, null);
+        const It1 = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, null, .forward);
         try t.expect(It1.predictsFlat(.{&inc}, .{&exc}));
     }
     {
@@ -2142,7 +2284,156 @@ test "BitTree CommonIterator: prunable picks tree" {
             inc.setWord(w, 0xAAAAAAAAAAAAAAAA, std.math.maxInt(u64));
             exc.setWord(w, 0xAAAAAAAAAAAAAAAA, std.math.maxInt(u64));
         }
-        const It1 = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, null);
+        const It1 = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, null, .forward);
         try t.expect(It1.predictsFlat(.{&inc}, .{&exc}));
+    }
+}
+
+fn rangeCheckTree(comptime wt: WordType, n: u32, lo: ?u32, hi: ?u32) !void {
+    var tree = BitTree(wt){};
+    defer tree.deinit(t.allocator);
+    try tree.resize(t.allocator, n, .inactive);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        if (i % 3 == 0 or i % 7 == 1) tree.setBit(i, .active);
+    }
+
+    const r_lo: u32 = @min(lo orelse 0, hi orelse n);
+    const r_hi: u32 = @max(lo orelse 0, hi orelse n);
+    const c_lo: u32 = @min(r_lo, n);
+    const c_hi: u32 = @min(r_hi, n);
+
+    var exp_a: [512]u32 = undefined;
+    var exp_i: [512]u32 = undefined;
+    const n_a = treeOracleRange(wt, &tree, .active, c_lo, c_hi, &exp_a);
+    const n_i = treeOracleRange(wt, &tree, .inactive, c_lo, c_hi, &exp_i);
+
+    const ItFF = BitTree(wt).Iterator(*TreeStepIds, treePushA, treePushI, .forward);
+    const ItFB = BitTree(wt).Iterator(*TreeStepIds, treePushA, treePushI, .backward);
+    var flat_f = TreeStepIds{};
+    var flat_b = TreeStepIds{};
+    var tree_f = TreeStepIds{};
+    var tree_b = TreeStepIds{};
+    try t.expect(ItFF.iterateFlat(.{ .tree = &tree, .context = &flat_f }, lo, hi));
+    try t.expect(ItFB.iterateFlat(.{ .tree = &tree, .context = &flat_b }, lo, hi));
+    try t.expect(ItFF.iterateTree(.{ .tree = &tree, .context = &tree_f }, lo, hi));
+    try t.expect(ItFB.iterateTree(.{ .tree = &tree, .context = &tree_b }, lo, hi));
+
+    try t.expectEqualSlices(u32, exp_a[0..n_a], flat_f.active[0..flat_f.na]);
+    try t.expectEqualSlices(u32, exp_i[0..n_i], flat_f.inactive[0..flat_f.ni]);
+    try t.expectEqualSlices(u32, exp_a[0..n_a], tree_f.active[0..tree_f.na]);
+    try t.expectEqualSlices(u32, exp_i[0..n_i], tree_f.inactive[0..tree_f.ni]);
+
+    var rev_a: [512]u32 = undefined;
+    var rev_i: [512]u32 = undefined;
+    for (0..n_a) |j| rev_a[j] = exp_a[n_a - 1 - j];
+    for (0..n_i) |j| rev_i[j] = exp_i[n_i - 1 - j];
+    try t.expectEqualSlices(u32, rev_a[0..n_a], flat_b.active[0..flat_b.na]);
+    try t.expectEqualSlices(u32, rev_i[0..n_i], flat_b.inactive[0..flat_b.ni]);
+    try t.expectEqualSlices(u32, rev_a[0..n_a], tree_b.active[0..tree_b.na]);
+    try t.expectEqualSlices(u32, rev_i[0..n_i], tree_b.inactive[0..tree_b.ni]);
+
+    const ItAF = BitTree(wt).Iterator(*TreeStepIds, treePushA, treePushI, .forward);
+    var auto_f = TreeStepIds{};
+    try t.expect(ItAF.iterateAll(.{ .tree = &tree, .context = &auto_f }, lo, hi));
+    try t.expectEqualSlices(u32, exp_a[0..n_a], auto_f.active[0..auto_f.na]);
+    try t.expectEqualSlices(u32, exp_i[0..n_i], auto_f.inactive[0..auto_f.ni]);
+}
+
+fn treeOracleRange(comptime wt: WordType, tree: *const BitTree(wt), target: BitState, lo: u32, hi: u32, out: *[512]u32) usize {
+    const BW = bit_word.BitWord(wt);
+    var count: usize = 0;
+    var i: u32 = lo;
+    while (i < hi) : (i += 1) {
+        const wid: usize = @intCast(BW.bitToWordId(i));
+        if (BW.readBitState(tree.bitset.words.items[wid], BW.bitIdInWord(i)) == target) {
+            out[count] = i;
+            count += 1;
+        }
+    }
+    return count;
+}
+
+test "BitTree iterate: flat/tree parity over ranges both directions" {
+    const bounds = [_][2]?u32{
+        .{ null, null },
+        .{ 0, 500 },
+        .{ 5, 70 },
+        .{ 70, 5 },
+        .{ 0, 1 },
+        .{ 63, 65 },
+        .{ 64, 128 },
+        .{ 499, 500 },
+        .{ 500, 500 },
+        .{ 600, 700 },
+        .{ null, 10 },
+        .{ 490, null },
+    };
+    for (bounds) |b| {
+        try rangeCheckTree(.u64, 500, b[0], b[1]);
+        try rangeCheckTree(.u64, 70, b[0], b[1]);
+        try rangeCheckTree(.u64, 0, b[0], b[1]);
+    }
+    const deep_bounds = [_][2]?u32{
+        .{ 4090, 4100 },
+        .{ 0, 64 },
+        .{ 8128, 8192 },
+        .{ 8192, 8192 },
+        .{ 9000, 9500 },
+        .{ 8180, null },
+    };
+    for (deep_bounds) |b| {
+        try rangeCheckTree(.u64, 8192, b[0], b[1]);
+    }
+}
+
+test "BitTree CommonIterator: ranges both directions vs oracle" {
+    var inc = try initCommonTree(.u64, 1000, .zero);
+    var exc = try initCommonTree(.u64, 1000, .zero);
+    defer inc.deinit(t.allocator);
+    defer exc.deinit(t.allocator);
+    var b: u32 = 0;
+    while (b < 1000) : (b += 1) {
+        if (b % 2 == 0) inc.setBit(b, .active);
+        if (b % 5 == 0) exc.setBit(b, .active);
+    }
+    const bounds = [_][2]?u32{
+        .{ null, null },
+        .{ 10, 990 },
+        .{ 990, 10 },
+        .{ 0, 64 },
+        .{ 999, 1000 },
+        .{ 500, 500 },
+    };
+    for (bounds) |r| {
+        const r_lo: u32 = @min(r[0] orelse 0, r[1] orelse 1000);
+        const r_hi: u32 = @max(r[0] orelse 0, r[1] orelse 1000);
+        const c_lo: u32 = @min(r_lo, 1000);
+        const c_hi: u32 = @min(r_hi, 1000);
+        var exp: [512]u32 = undefined;
+        var n_exp: usize = 0;
+        var k: u32 = c_lo;
+        while (k < c_hi) : (k += 1) {
+            if (k % 2 == 0 and k % 5 != 0) {
+                exp[n_exp] = k;
+                n_exp += 1;
+            }
+        }
+        const ItF = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, null, .forward);
+        const ItB = BitTree(.u64).CommonIterator(1, 1, *TreeStepIds, treePushA, null, .backward);
+        var fwd = TreeStepIds{};
+        var bwd = TreeStepIds{};
+        var flat = TreeStepIds{};
+        var tree = TreeStepIds{};
+        try t.expect(ItF.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &fwd }, r[0], r[1]));
+        try t.expect(ItB.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &bwd }, r[0], r[1]));
+        try t.expect(ItF.iterateFlat(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &flat }, r[0], r[1]));
+        try t.expect(ItF.iterateTree(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &tree }, r[0], r[1]));
+        try t.expectEqualSlices(u32, exp[0..n_exp], fwd.active[0..fwd.na]);
+        try t.expectEqualSlices(u32, exp[0..n_exp], flat.active[0..flat.na]);
+        try t.expectEqualSlices(u32, exp[0..n_exp], tree.active[0..tree.na]);
+        var rev: [512]u32 = undefined;
+        for (0..n_exp) |j| rev[j] = exp[n_exp - 1 - j];
+        try t.expectEqualSlices(u32, rev[0..n_exp], bwd.active[0..bwd.na]);
     }
 }

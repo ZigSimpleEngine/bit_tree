@@ -149,6 +149,7 @@ pub fn Layer(comptime wt: WordType) type {
             comptime on_active: InlineIteratorCallback(Context),
             comptime on_mixed: IteratorCallback(Context),
             comptime on_deep_mixed: InlineIteratorCallback(Context),
+            comptime direction: utilities.Direction,
         ) type {
             return struct {
                 /// Visits one word and routes each valid bit to its state callback.
@@ -162,6 +163,175 @@ pub fn Layer(comptime wt: WordType) type {
                     } else {
                         return stepPending(data, word_id);
                     }
+                }
+
+                /// Scans words inside an optional bit range in walk order.
+                /// - `data` - level and caller context.
+                /// - `start_bit` - range edge or null for no lower limit.
+                /// - `end_bit` - range edge or null for no upper limit.
+                ///
+                /// Return - false on early exit, true when the scan completed.
+                pub inline fn iterateAll(data: LayerWithContext(Context), start_bit: ?u32, end_bit: ?u32) bool {
+                    const layer = data.layer;
+                    if (layer.activity.items.len == 0) return true;
+                    const range = utilities.resolveRange(layer.bits_count, start_bit, end_bit);
+                    if (range.lo >= range.hi) return true;
+                    const lo_word: usize = @intCast(bw.bitToWordId(range.lo));
+                    const hi_word: usize = @intCast(bw.bitToWordId(range.hi - 1));
+                    var wid: usize = if (direction == .forward) lo_word else hi_word;
+                    while (true) {
+                        const w_base = bw.wordToBitId(@truncate(wid));
+                        const s = @max(range.lo, w_base) - w_base;
+                        const e = @min(range.hi, w_base + bw.word_type_bits) - w_base;
+                        if (!stepRange(data, @truncate(wid), s, e)) return false;
+                        if (wid == (if (direction == .forward) hi_word else lo_word)) break;
+                        wid = if (direction == .forward) wid + 1 else wid - 1;
+                    }
+                    return true;
+                }
+
+                /// Visits only the `[sub_lo, sub_hi)` lanes of one word.
+                /// - `data` - level and caller context.
+                /// - `word_id` - word index to scan.
+                /// - `sub_lo` - first visited lane, inclusive.
+                /// - `sub_hi` - one past the last visited lane, exclusive.
+                ///
+                /// Return - false on early exit, true when the lanes completed.
+                inline fn stepRange(data: LayerWithContext(Context), word_id: u32, sub_lo: u32, sub_hi: u32) bool {
+                    const layer = data.layer;
+                    const context = data.context;
+                    std.debug.assert(word_id < layer.activity.items.len);
+                    std.debug.assert(layer.activity.items.len == layer.mixed.items.len);
+                    const activity_word = layer.activity.items[word_id];
+                    const mixed_word = layer.mixed.items[word_id];
+                    const start = bw.wordToBitId(word_id);
+                    const range = rangeMask(sub_lo, sub_hi);
+
+                    if (on_inactive != null and on_active != null and on_mixed != null and on_deep_mixed != null) {
+                        if (direction == .forward) {
+                            var i: u32 = sub_lo;
+                            while (i < sub_hi) : (i += 1) {
+                                if (!visitLane(context, start + i, activity_word, mixed_word, i)) return false;
+                            }
+                        } else {
+                            var i: u32 = sub_hi;
+                            while (i > sub_lo) {
+                                i -= 1;
+                                if (!visitLane(context, start + i, activity_word, mixed_word, i)) return false;
+                            }
+                        }
+                        return true;
+                    }
+
+                    const only_inactive_word = (~activity_word) & (~mixed_word) & range;
+                    const only_active_word = activity_word & (~mixed_word) & range;
+                    const only_mixed_word = (~activity_word) & mixed_word & range;
+                    const only_deep_mixed = activity_word & mixed_word & range;
+
+                    var pending_word: Word = 0;
+                    if (on_inactive != null) pending_word |= only_inactive_word;
+                    if (on_active != null) pending_word |= only_active_word;
+                    if (on_mixed != null) pending_word |= only_mixed_word;
+                    if (on_deep_mixed != null) pending_word |= only_deep_mixed;
+
+                    if (direction == .forward) {
+                        while (pending_word != 0) {
+                            const bit_id_in_word: u32 = @ctz(pending_word);
+                            pending_word &= pending_word - 1;
+                            if (!visitPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
+                        }
+                    } else {
+                        while (pending_word != 0) {
+                            const lz: u32 = @clz(pending_word);
+                            const bit_id_in_word = bw.word_type_bits - 1 - lz;
+                            pending_word ^= @as(Word, 1) << @truncate(bit_id_in_word);
+                            if (!visitPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
+                        }
+                    }
+                    return true;
+                }
+
+                /// Routes one classified lane to its state callback.
+                /// - `context` - caller context for the callbacks.
+                /// - `bit_id` - global id of the visited lane.
+                /// - `activity_word` - raw activity plane of the word.
+                /// - `mixed_word` - raw mixed plane of the word.
+                /// - `i` - lane index inside the word.
+                ///
+                /// Return - false on early exit, true to continue.
+                inline fn visitLane(context: Context, bit_id: u32, activity_word: Word, mixed_word: Word, i: u32) bool {
+                    const abit: u1 = @truncate(activity_word >> @truncate(i));
+                    const mbit: u1 = @truncate(mixed_word >> @truncate(i));
+                    if (abit == 0 and mbit == 0) {
+                        if (on_inactive) |f| {
+                            if (!f(context, bit_id)) return false;
+                        }
+                    } else if (abit == 1 and mbit == 0) {
+                        if (on_active) |f| {
+                            if (!f(context, bit_id)) return false;
+                        }
+                    } else if (abit == 0) {
+                        if (on_mixed) |f| {
+                            if (!f(context, bit_id)) return false;
+                        }
+                    } else {
+                        if (on_deep_mixed) |f| {
+                            if (!f(context, bit_id)) return false;
+                        }
+                    }
+                    return true;
+                }
+
+                /// Routes one peeled lane to the installed state callback.
+                /// - `context` - caller context for the callbacks.
+                /// - `bit_id` - global id of the visited lane.
+                /// - `bit_id_in_word` - lane index inside the word.
+                /// - `only_inactive_word` - masked inactive lanes.
+                /// - `only_active_word` - masked active lanes.
+                /// - `only_mixed_word` - masked mixed lanes.
+                /// - `only_deep_mixed` - masked deeply mixed lanes.
+                ///
+                /// Return - false on early exit, true to continue.
+                inline fn visitPendingLane(context: Context, bit_id: u32, bit_id_in_word: u32, only_inactive_word: Word, only_active_word: Word, only_mixed_word: Word, only_deep_mixed: Word) bool {
+                    const bit: Word = @as(Word, 1) << @truncate(bit_id_in_word);
+                    if (on_inactive) |f| {
+                        if ((only_inactive_word & bit) != 0) {
+                            if (!f(context, bit_id)) return false;
+                            return true;
+                        }
+                    }
+                    if (on_active) |f| {
+                        if ((only_active_word & bit) != 0) {
+                            if (!f(context, bit_id)) return false;
+                            return true;
+                        }
+                    }
+                    if (on_mixed) |f| {
+                        if ((only_mixed_word & bit) != 0) {
+                            if (!f(context, bit_id)) return false;
+                            return true;
+                        }
+                    }
+                    if (on_deep_mixed) |f| {
+                        if ((only_deep_mixed & bit) != 0) {
+                            if (!f(context, bit_id)) return false;
+                            return true;
+                        }
+                    }
+                    return true;
+                }
+
+                /// Builds a mask keeping exactly the `[s, e)` lanes of one word.
+                /// - `s` - first kept lane, inclusive.
+                /// - `e` - one past the last kept lane, exclusive.
+                ///
+                /// Return - mask with only the sub-range lanes set.
+                inline fn rangeMask(s: u32, e: u32) Word {
+                    if (s >= e) return 0;
+                    var m: Word = bw.max_value;
+                    if (s != 0) m &= bw.max_value << @truncate(s);
+                    if (e != bw.word_type_bits) m &= ~(bw.max_value << @truncate(e));
+                    return m;
                 }
 
                 /// Fast path when all four callbacks exist, scans linearly by bound.
@@ -183,27 +353,16 @@ pub fn Layer(comptime wt: WordType) type {
                         const used = bw.bitIdInWord(layer.bits_count);
                         if (used != 0) bound = used;
                     }
-                    var i: u32 = 0;
-                    while (i < bound) : (i += 1) {
-                        const abit: u1 = @truncate(activity_word >> @truncate(i));
-                        const mbit: u1 = @truncate(mixed_word >> @truncate(i));
-                        const bit_id = start + i;
-                        if (abit == 0 and mbit == 0) {
-                            if (on_inactive) |f| {
-                                if (!f(context, bit_id)) return false;
-                            }
-                        } else if (abit == 1 and mbit == 0) {
-                            if (on_active) |f| {
-                                if (!f(context, bit_id)) return false;
-                            }
-                        } else if (abit == 0) {
-                            if (on_mixed) |f| {
-                                if (!f(context, bit_id)) return false;
-                            }
-                        } else {
-                            if (on_deep_mixed) |f| {
-                                if (!f(context, bit_id)) return false;
-                            }
+                    if (direction == .forward) {
+                        var i: u32 = 0;
+                        while (i < bound) : (i += 1) {
+                            if (!visitLane(context, start + i, activity_word, mixed_word, i)) return false;
+                        }
+                    } else {
+                        var i: u32 = bound;
+                        while (i > 0) {
+                            i -= 1;
+                            if (!visitLane(context, start + i, activity_word, mixed_word, i)) return false;
                         }
                     }
                     return true;
@@ -243,38 +402,18 @@ pub fn Layer(comptime wt: WordType) type {
                     if (on_mixed != null) pending_word |= only_mixed_word;
                     if (on_deep_mixed != null) pending_word |= only_deep_mixed;
 
-                    while (pending_word != 0) {
-                        const bit_id_in_word: u32 = @ctz(pending_word);
-                        const bit_id = start + bit_id_in_word;
-                        const bit: Word = @as(Word, 1) << @truncate(bit_id_in_word);
-                        pending_word &= pending_word - 1;
-
-                        if (on_inactive) |f| {
-                            if ((only_inactive_word & bit) != 0) {
-                                if (!f(context, bit_id)) return false;
-                                continue;
-                            }
+                    if (direction == .forward) {
+                        while (pending_word != 0) {
+                            const bit_id_in_word: u32 = @ctz(pending_word);
+                            pending_word &= pending_word - 1;
+                            if (!visitPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
                         }
-
-                        if (on_active) |f| {
-                            if ((only_active_word & bit) != 0) {
-                                if (!f(context, bit_id)) return false;
-                                continue;
-                            }
-                        }
-
-                        if (on_mixed) |f| {
-                            if ((only_mixed_word & bit) != 0) {
-                                if (!f(context, bit_id)) return false;
-                                continue;
-                            }
-                        }
-
-                        if (on_deep_mixed) |f| {
-                            if ((only_deep_mixed & bit) != 0) {
-                                if (!f(context, bit_id)) return false;
-                                continue;
-                            }
+                    } else {
+                        while (pending_word != 0) {
+                            const lz: u32 = @clz(pending_word);
+                            const bit_id_in_word = bw.word_type_bits - 1 - lz;
+                            pending_word ^= @as(Word, 1) << @truncate(bit_id_in_word);
+                            if (!visitPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
                         }
                     }
 
@@ -292,6 +431,7 @@ pub fn Layer(comptime wt: WordType) type {
             comptime on_active: InlineIteratorCallback(Context),
             comptime on_mixed: IteratorCallback(Context),
             comptime on_deep_mixed: InlineIteratorCallback(Context),
+            comptime direction: utilities.Direction,
         ) type {
             return struct {
                 /// Visits one word and routes each valid bit to its state callback.
@@ -306,6 +446,170 @@ pub fn Layer(comptime wt: WordType) type {
                     } else {
                         return stepPending(data, word_id);
                     }
+                }
+
+                /// Scans words inside an optional bit range in walk order.
+                /// - `data` - levels and caller context.
+                /// - `start_bit` - range edge or null for no lower limit.
+                /// - `end_bit` - range edge or null for no upper limit.
+                ///
+                /// Return - false on early exit, true when the scan completed.
+                pub inline fn iterateAll(data: LayersWithContext(include_len, exclude_len, Context), start_bit: ?u32, end_bit: ?u32) bool {
+                    if (include_len == 0 and exclude_len == 0) return true;
+                    const first = if (include_len > 0) data.includes[0] else data.excludes[0];
+                    if (first.activity.items.len == 0) return true;
+                    const range = utilities.resolveRange(first.bits_count, start_bit, end_bit);
+                    if (range.lo >= range.hi) return true;
+                    const lo_word: usize = @intCast(bw.bitToWordId(range.lo));
+                    const hi_word: usize = @intCast(bw.bitToWordId(range.hi - 1));
+                    var wid: usize = if (direction == .forward) lo_word else hi_word;
+                    while (true) {
+                        const w_base = bw.wordToBitId(@truncate(wid));
+                        const s = @max(range.lo, w_base) - w_base;
+                        const e = @min(range.hi, w_base + bw.word_type_bits) - w_base;
+                        if (!stepRange(data, @truncate(wid), s, e)) return false;
+                        if (wid == (if (direction == .forward) hi_word else lo_word)) break;
+                        wid = if (direction == .forward) wid + 1 else wid - 1;
+                    }
+                    return true;
+                }
+
+                /// Visits only the `[sub_lo, sub_hi)` lanes of one word.
+                /// - `data` - levels and caller context.
+                /// - `word_id` - word index to scan.
+                /// - `sub_lo` - first visited lane, inclusive.
+                /// - `sub_hi` - one past the last visited lane, exclusive.
+                ///
+                /// Return - false on early exit, true when the lanes completed.
+                inline fn stepRange(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32, sub_lo: u32, sub_hi: u32) bool {
+                    const context = data.context;
+                    const start = bw.wordToBitId(word_id);
+                    const range = rangeMask(sub_lo, sub_hi);
+                    const inactive_mask = commonInactiveWord(data, word_id) & range;
+                    const active_mask = commonActiveWord(data, word_id) & range;
+                    const mixed_mask = commonMixedWord(data, word_id) & range;
+                    const deep_mask = commonDeepWord(data, word_id) & range;
+
+                    if (on_inactive != null and on_active != null and on_mixed != null and on_deep_mixed != null) {
+                        if (direction == .forward) {
+                            var i: u32 = sub_lo;
+                            while (i < sub_hi) : (i += 1) {
+                                if (!visitCommonLane(context, start + i, inactive_mask, active_mask, mixed_mask, deep_mask, i)) return false;
+                            }
+                        } else {
+                            var i: u32 = sub_hi;
+                            while (i > sub_lo) {
+                                i -= 1;
+                                if (!visitCommonLane(context, start + i, inactive_mask, active_mask, mixed_mask, deep_mask, i)) return false;
+                            }
+                        }
+                        return true;
+                    }
+
+                    var pending_word: Word = 0;
+                    if (on_inactive != null) pending_word |= inactive_mask;
+                    if (on_active != null) pending_word |= active_mask;
+                    if (on_mixed != null) pending_word |= mixed_mask;
+                    if (on_deep_mixed != null) pending_word |= deep_mask;
+
+                    if (direction == .forward) {
+                        while (pending_word != 0) {
+                            const bit_id_in_word: u32 = @ctz(pending_word);
+                            pending_word &= pending_word - 1;
+                            if (!visitCommonPendingLane(context, start + bit_id_in_word, bit_id_in_word, inactive_mask, active_mask, mixed_mask, deep_mask)) return false;
+                        }
+                    } else {
+                        while (pending_word != 0) {
+                            const lz: u32 = @clz(pending_word);
+                            const bit_id_in_word = bw.word_type_bits - 1 - lz;
+                            pending_word ^= @as(Word, 1) << @truncate(bit_id_in_word);
+                            if (!visitCommonPendingLane(context, start + bit_id_in_word, bit_id_in_word, inactive_mask, active_mask, mixed_mask, deep_mask)) return false;
+                        }
+                    }
+                    return true;
+                }
+
+                /// Routes one classified lane to its common state callback.
+                /// - `context` - caller context for the callbacks.
+                /// - `bit_id` - global id of the visited lane.
+                /// - `inactive_mask` - merged inactive lanes.
+                /// - `active_mask` - merged active lanes.
+                /// - `mixed_mask` - merged mixed lanes.
+                /// - `deep_mask` - merged deeply mixed lanes.
+                /// - `i` - lane index inside the word.
+                ///
+                /// Return - false on early exit, true to continue.
+                inline fn visitCommonLane(context: Context, bit_id: u32, inactive_mask: Word, active_mask: Word, mixed_mask: Word, deep_mask: Word, i: u32) bool {
+                    if (((inactive_mask >> @truncate(i)) & 1) != 0) {
+                        if (on_inactive) |f| {
+                            if (!f(context, bit_id)) return false;
+                        }
+                    } else if (((active_mask >> @truncate(i)) & 1) != 0) {
+                        if (on_active) |f| {
+                            if (!f(context, bit_id)) return false;
+                        }
+                    } else if (((mixed_mask >> @truncate(i)) & 1) != 0) {
+                        if (on_mixed) |f| {
+                            if (!f(context, bit_id)) return false;
+                        }
+                    } else if (((deep_mask >> @truncate(i)) & 1) != 0) {
+                        if (on_deep_mixed) |f| {
+                            if (!f(context, bit_id)) return false;
+                        }
+                    }
+                    return true;
+                }
+
+                /// Routes one peeled lane to the installed common state callback.
+                /// - `context` - caller context for the callbacks.
+                /// - `bit_id` - global id of the visited lane.
+                /// - `bit_id_in_word` - lane index inside the word.
+                /// - `inactive_mask` - merged inactive lanes.
+                /// - `active_mask` - merged active lanes.
+                /// - `mixed_mask` - merged mixed lanes.
+                /// - `deep_mask` - merged deeply mixed lanes.
+                ///
+                /// Return - false on early exit, true to continue.
+                inline fn visitCommonPendingLane(context: Context, bit_id: u32, bit_id_in_word: u32, inactive_mask: Word, active_mask: Word, mixed_mask: Word, deep_mask: Word) bool {
+                    const bit: Word = @as(Word, 1) << @truncate(bit_id_in_word);
+                    if (on_inactive) |f| {
+                        if ((inactive_mask & bit) != 0) {
+                            if (!f(context, bit_id)) return false;
+                            return true;
+                        }
+                    }
+                    if (on_active) |f| {
+                        if ((active_mask & bit) != 0) {
+                            if (!f(context, bit_id)) return false;
+                            return true;
+                        }
+                    }
+                    if (on_mixed) |f| {
+                        if ((mixed_mask & bit) != 0) {
+                            if (!f(context, bit_id)) return false;
+                            return true;
+                        }
+                    }
+                    if (on_deep_mixed) |f| {
+                        if ((deep_mask & bit) != 0) {
+                            if (!f(context, bit_id)) return false;
+                            return true;
+                        }
+                    }
+                    return true;
+                }
+
+                /// Builds a mask keeping exactly the `[s, e)` lanes of one word.
+                /// - `s` - first kept lane, inclusive.
+                /// - `e` - one past the last kept lane, exclusive.
+                ///
+                /// Return - mask with only the sub-range lanes set.
+                inline fn rangeMask(s: u32, e: u32) Word {
+                    if (s >= e) return 0;
+                    var m: Word = bw.max_value;
+                    if (s != 0) m &= bw.max_value << @truncate(s);
+                    if (e != bw.word_type_bits) m &= ~(bw.max_value << @truncate(e));
+                    return m;
                 }
 
                 /// Fast path when all four callbacks exist, scans linearly by bound.
@@ -328,25 +632,16 @@ pub fn Layer(comptime wt: WordType) type {
                         const used = bw.bitIdInWord(first.bits_count);
                         if (used != 0) bound = used;
                     }
-                    var i: u32 = 0;
-                    while (i < bound) : (i += 1) {
-                        const bit_id = start + i;
-                        if (((inactive_mask >> @truncate(i)) & 1) != 0) {
-                            if (on_inactive) |f| {
-                                if (!f(context, bit_id)) return false;
-                            }
-                        } else if (((active_mask >> @truncate(i)) & 1) != 0) {
-                            if (on_active) |f| {
-                                if (!f(context, bit_id)) return false;
-                            }
-                        } else if (((mixed_mask >> @truncate(i)) & 1) != 0) {
-                            if (on_mixed) |f| {
-                                if (!f(context, bit_id)) return false;
-                            }
-                        } else if (((deep_mask >> @truncate(i)) & 1) != 0) {
-                            if (on_deep_mixed) |f| {
-                                if (!f(context, bit_id)) return false;
-                            }
+                    if (direction == .forward) {
+                        var i: u32 = 0;
+                        while (i < bound) : (i += 1) {
+                            if (!visitCommonLane(context, start + i, inactive_mask, active_mask, mixed_mask, deep_mask, i)) return false;
+                        }
+                    } else {
+                        var i: u32 = bound;
+                        while (i > 0) {
+                            i -= 1;
+                            if (!visitCommonLane(context, start + i, inactive_mask, active_mask, mixed_mask, deep_mask, i)) return false;
                         }
                     }
                     return true;
@@ -381,38 +676,18 @@ pub fn Layer(comptime wt: WordType) type {
                     if (on_mixed != null) pending_word |= only_mixed_word;
                     if (on_deep_mixed != null) pending_word |= only_deep_mixed;
 
-                    while (pending_word != 0) {
-                        const bit_id_in_word: u32 = @ctz(pending_word);
-                        const bit_id = start + bit_id_in_word;
-                        const bit: Word = @as(Word, 1) << @truncate(bit_id_in_word);
-                        pending_word &= pending_word - 1;
-
-                        if (on_inactive) |f| {
-                            if ((only_inactive_word & bit) != 0) {
-                                if (!f(context, bit_id)) return false;
-                                continue;
-                            }
+                    if (direction == .forward) {
+                        while (pending_word != 0) {
+                            const bit_id_in_word: u32 = @ctz(pending_word);
+                            pending_word &= pending_word - 1;
+                            if (!visitCommonPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
                         }
-
-                        if (on_active) |f| {
-                            if ((only_active_word & bit) != 0) {
-                                if (!f(context, bit_id)) return false;
-                                continue;
-                            }
-                        }
-
-                        if (on_mixed) |f| {
-                            if ((only_mixed_word & bit) != 0) {
-                                if (!f(context, bit_id)) return false;
-                                continue;
-                            }
-                        }
-
-                        if (on_deep_mixed) |f| {
-                            if ((only_deep_mixed & bit) != 0) {
-                                if (!f(context, bit_id)) return false;
-                                continue;
-                            }
+                    } else {
+                        while (pending_word != 0) {
+                            const lz: u32 = @clz(pending_word);
+                            const bit_id_in_word = bw.word_type_bits - 1 - lz;
+                            pending_word ^= @as(Word, 1) << @truncate(bit_id_in_word);
+                            if (!visitCommonPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
                         }
                     }
 
@@ -952,7 +1227,7 @@ inline fn stepPushD(ctx: *StepStates, bit_id: u32) bool {
 }
 
 fn stepCollectAll(comptime wt: WordType, layer: *Layer(wt), ctx: *StepStates) bool {
-    const It = Layer(wt).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+    const It = Layer(wt).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
     var wid: u32 = 0;
     while (wid < layer.activity.items.len) : (wid += 1) {
         if (!It.step(.{ .layer = layer, .context = ctx }, wid)) return false;
@@ -1059,7 +1334,7 @@ test "Layer step: early exit stops the walk" {
         var layer: Layer(.u64) = .{};
         defer layer.deinit(t.allocator);
         try layer.resize(t.allocator, 70, .inactive);
-        const It = Layer(.u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        const It = Layer(.u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 3 };
         try t.expect(!It.step(.{ .layer = &layer, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 3), ctx.ni);
@@ -1073,7 +1348,7 @@ test "Layer step: early exit stops the walk" {
         try layer.resize(t.allocator, 10, .inactive);
         layerSetState(.u64, &layer, 0, .active);
         layerSetState(.u64, &layer, 9, .active);
-        const It = Layer(.u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        const It = Layer(.u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 10 };
 
         try t.expect(!It.step(.{ .layer = &layer, .context = &ctx }, 0));
@@ -1085,7 +1360,7 @@ test "Layer step: early exit stops the walk" {
         var layer: Layer(.u64) = .{};
         defer layer.deinit(t.allocator);
         try layer.resize(t.allocator, 130, .deep_mixed);
-        const It = Layer(.u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        const It = Layer(.u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 70 };
         try t.expect(It.step(.{ .layer = &layer, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 64), ctx.nd);
@@ -1099,7 +1374,7 @@ test "Layer step: early exit stops the walk" {
         var layer: Layer(.u64) = .{};
         defer layer.deinit(t.allocator);
         try layer.resize(t.allocator, 10, .mixed);
-        const It = Layer(.u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        const It = Layer(.u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 1 };
         try t.expect(!It.step(.{ .layer = &layer, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 1), ctx.ni + ctx.na + ctx.nm + ctx.nd);
@@ -1153,7 +1428,7 @@ fn commonStepCollect(
     excludes: [EL]*Layer(wt),
     ctx: *StepStates,
 ) bool {
-    const It = Layer(wt).CommonIterator(IL, EL, *StepStates, on_i, on_a, on_m, on_d);
+    const It = Layer(wt).CommonIterator(IL, EL, *StepStates, on_i, on_a, on_m, on_d, .forward);
     if (IL == 0 and EL == 0) return true;
     const words_len = if (IL > 0) includes[0].activity.items.len else excludes[0].activity.items.len;
     var wid: u32 = 0;
@@ -1171,7 +1446,7 @@ fn commonStepCollectOrder(
     excludes: [EL]*Layer(wt),
     ctx: *CommonOrderStates,
 ) bool {
-    const It = Layer(wt).CommonIterator(IL, EL, *CommonOrderStates, commonOrderPushI, commonOrderPushA, commonOrderPushM, commonOrderPushD);
+    const It = Layer(wt).CommonIterator(IL, EL, *CommonOrderStates, commonOrderPushI, commonOrderPushA, commonOrderPushM, commonOrderPushD, .forward);
     if (IL == 0 and EL == 0) return true;
     const words_len = if (IL > 0) includes[0].activity.items.len else excludes[0].activity.items.len;
     var wid: u32 = 0;
@@ -1421,7 +1696,7 @@ test "Layer CommonIterator: spec poles 1+1" {
     layerSetState(.u8, &exc, 2, .deep_mixed);
     layerSetState(.u8, &exc, 3, .mixed);
 
-    const It = Layer(.u8).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+    const It = Layer(.u8).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
     var ctx = StepStates{};
     try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
     try t.expectEqualSlices(u32, &[_]u32{0}, ctx.inactive[0..ctx.ni]);
@@ -1442,7 +1717,7 @@ test "Layer CommonIterator: 1+1 truth table" {
             try exc.resize(t.allocator, 1, .inactive);
             layerSetState(.u8, &inc, 0, si);
             layerSetState(.u8, &exc, 0, se);
-            const It = Layer(.u8).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+            const It = Layer(.u8).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
             var ctx = StepStates{};
             try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
             const si_nt = si == .mixed or si == .deep_mixed;
@@ -1494,7 +1769,7 @@ fn commonCheckSingleMatchesIterator(comptime wt: WordType, n: u32, pat: StepPatt
 
     var ref = StepStates{};
     var wid: u32 = 0;
-    const It = Layer(wt).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+    const It = Layer(wt).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
     while (wid < layer.activity.items.len) : (wid += 1) {
         if (!It.step(.{ .layer = &layer, .context = &ref }, wid)) break;
     }
@@ -1870,7 +2145,7 @@ test "Layer CommonIterator: early exit stops the walk" {
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 70, .inactive);
         try exc.resize(t.allocator, 70, .active);
-        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 3 };
         try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 3), ctx.ni);
@@ -1887,7 +2162,7 @@ test "Layer CommonIterator: early exit stops the walk" {
         layerSetState(.u64, &inc, 0, .active);
         layerSetState(.u64, &inc, 9, .active);
         layerSetState(.u64, &exc, 0, .inactive);
-        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 4 };
         try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqualSlices(u32, &[_]u32{0}, ctx.active[0..ctx.na]);
@@ -1900,7 +2175,7 @@ test "Layer CommonIterator: early exit stops the walk" {
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 130, .deep_mixed);
         try exc.resize(t.allocator, 130, .deep_mixed);
-        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 70 };
         try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 64), ctx.nd);
@@ -1916,7 +2191,7 @@ test "Layer CommonIterator: early exit stops the walk" {
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 10, .mixed);
         try exc.resize(t.allocator, 10, .deep_mixed);
-        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 1 };
         try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 1), ctx.total());
@@ -1929,12 +2204,12 @@ test "Layer CommonIterator: early exit stops the walk" {
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 10, .active);
         try exc.resize(t.allocator, 10, .inactive);
-        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 50 };
         try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 10), ctx.na);
         var only_d = StepStates{ .stop_after = 1 };
-        const ItD = Layer(.u64).CommonIterator(1, 1, *StepStates, null, null, null, stepPushD);
+        const ItD = Layer(.u64).CommonIterator(1, 1, *StepStates, null, null, null, stepPushD, .forward);
         try t.expect(ItD.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &only_d }, 0));
         try t.expectEqual(@as(usize, 0), only_d.total());
     }
@@ -1955,7 +2230,7 @@ test "Layer CommonIterator: empty sets and zero lens" {
         try t.expectEqual(@as(usize, 0), ctx.total());
     }
     {
-        const It00 = Layer(.u64).CommonIterator(0, 0, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        const It00 = Layer(.u64).CommonIterator(0, 0, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{};
         try t.expect(It00.step(.{ .includes = .{}, .excludes = .{}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 0), ctx.total());
@@ -2096,4 +2371,123 @@ test "Layer getBit: u8 all four states" {
     try t.expectEqual(L8.State.active, layer.getBit(1));
     try t.expectEqual(L8.State.mixed, layer.getBit(2));
     try t.expectEqual(L8.State.deep_mixed, layer.getBit(3));
+}
+
+fn rangeCheckLayer(comptime wt: WordType, n: u32, lo: ?u32, hi: ?u32) !void {
+    const L = Layer(wt);
+    var layer: L = .{};
+    defer layer.deinit(t.allocator);
+    try layer.resize(t.allocator, n, .inactive);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        layerSetState(wt, &layer, i, @enumFromInt(@as(u2, @truncate((i *% 2654435761) >> 29))));
+    }
+
+    const r_lo: u32 = @min(lo orelse 0, hi orelse n);
+    const r_hi: u32 = @max(lo orelse 0, hi orelse n);
+    const c_lo: u32 = @min(r_lo, n);
+    const c_hi: u32 = @min(r_hi, n);
+
+    var exp: [4][256]u32 = undefined;
+    var ns = [4]usize{ 0, 0, 0, 0 };
+    var k: u32 = c_lo;
+    while (k < c_hi) : (k += 1) {
+        const s: usize = @intFromEnum(layer.getBit(k));
+        exp[s][ns[s]] = k;
+        ns[s] += 1;
+    }
+
+    const ItF = L.Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
+    const ItB = L.Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .backward);
+    var fwd = StepStates{};
+    var bwd = StepStates{};
+    try t.expect(ItF.iterateAll(.{ .layer = &layer, .context = &fwd }, lo, hi));
+    try t.expect(ItB.iterateAll(.{ .layer = &layer, .context = &bwd }, lo, hi));
+    const got_f = [_][]const u32{
+        fwd.inactive[0..fwd.ni],
+        fwd.active[0..fwd.na],
+        fwd.mixed[0..fwd.nm],
+        fwd.deep[0..fwd.nd],
+    };
+    for (0..4) |s| try t.expectEqualSlices(u32, exp[s][0..ns[s]], got_f[s]);
+    const got_b = [_][]const u32{
+        bwd.inactive[0..bwd.ni],
+        bwd.active[0..bwd.na],
+        bwd.mixed[0..bwd.nm],
+        bwd.deep[0..bwd.nd],
+    };
+    for (0..4) |s| {
+        var rev: [256]u32 = undefined;
+        for (0..ns[s]) |j| rev[j] = exp[s][ns[s] - 1 - j];
+        try t.expectEqualSlices(u32, rev[0..ns[s]], got_b[s]);
+    }
+}
+
+test "Layer iterateAll: forward/backward ranges vs oracle" {
+    const bounds = [_][2]?u32{
+        .{ null, null },
+        .{ 0, 130 },
+        .{ 5, 70 },
+        .{ 70, 5 },
+        .{ 0, 1 },
+        .{ 63, 65 },
+        .{ 64, 128 },
+        .{ 129, 130 },
+        .{ 130, 130 },
+        .{ 500, 600 },
+        .{ null, 10 },
+        .{ 120, null },
+    };
+    for (bounds) |b| {
+        try rangeCheckLayer(.u64, 130, b[0], b[1]);
+        try rangeCheckLayer(.u8, 70, b[0], b[1]);
+        try rangeCheckLayer(.u64, 0, b[0], b[1]);
+        try rangeCheckLayer(.u64, 1, b[0], b[1]);
+    }
+}
+
+test "Layer CommonIterator iterateAll: ranges vs oracle" {
+    var inc: Layer(.u64) = .{};
+    var exc: Layer(.u64) = .{};
+    defer inc.deinit(t.allocator);
+    defer exc.deinit(t.allocator);
+    try inc.resize(t.allocator, 130, .inactive);
+    try exc.resize(t.allocator, 130, .inactive);
+    var i: u32 = 0;
+    while (i < 130) : (i += 1) {
+        layerSetState(.u64, &inc, i, if (i % 2 == 0) .active else .inactive);
+        layerSetState(.u64, &exc, i, if (i % 5 == 0) .active else .inactive);
+    }
+    const bounds = [_][2]?u32{
+        .{ null, null },
+        .{ 10, 100 },
+        .{ 100, 10 },
+        .{ 0, 64 },
+        .{ 129, 130 },
+    };
+    for (bounds) |b| {
+        const r_lo: u32 = @min(b[0] orelse 0, b[1] orelse 130);
+        const r_hi: u32 = @max(b[0] orelse 0, b[1] orelse 130);
+        const c_lo: u32 = @min(r_lo, 130);
+        const c_hi: u32 = @min(r_hi, 130);
+        var exp: [256]u32 = undefined;
+        var n_exp: usize = 0;
+        var k: u32 = c_lo;
+        while (k < c_hi) : (k += 1) {
+            if (k % 2 == 0 and k % 5 != 0) {
+                exp[n_exp] = k;
+                n_exp += 1;
+            }
+        }
+        const ItF = Layer(.u64).CommonIterator(1, 1, *StepStates, null, stepPushA, null, null, .forward);
+        const ItB = Layer(.u64).CommonIterator(1, 1, *StepStates, null, stepPushA, null, null, .backward);
+        var fwd = StepStates{};
+        var bwd = StepStates{};
+        try t.expect(ItF.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &fwd }, b[0], b[1]));
+        try t.expect(ItB.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &bwd }, b[0], b[1]));
+        try t.expectEqualSlices(u32, exp[0..n_exp], fwd.active[0..fwd.na]);
+        var rev: [256]u32 = undefined;
+        for (0..n_exp) |j| rev[j] = exp[n_exp - 1 - j];
+        try t.expectEqualSlices(u32, rev[0..n_exp], bwd.active[0..bwd.na]);
+    }
 }

@@ -19,6 +19,8 @@ pub const WordType = bit_word.WordType;
 pub const BitWord = bit_word.BitWord;
 /// Logical single-bit value shared across the package.
 pub const BitState = utilities.BitState;
+/// Walk order for every iterator in bitset, layer and tree.
+pub const Direction = utilities.Direction;
 /// Hierarchical tree type factory with adaptive iteration.
 pub const BitTree = bit_tree.BitTree;
 /// Thresholds that tune the flat versus tree iteration choice.

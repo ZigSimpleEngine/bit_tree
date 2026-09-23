@@ -61,6 +61,7 @@ pub fn Bitset(comptime wt: WordType) type {
             comptime Context: type,
             comptime on_active: InlineIteratorCallback(Context),
             comptime on_inactive: InlineIteratorCallback(Context),
+            comptime direction: utilities.Direction,
         ) type {
             return struct {
                 /// Visits one word and routes each valid bit to its callback.
@@ -75,59 +76,81 @@ pub fn Bitset(comptime wt: WordType) type {
                         return stepPending(data, word_id);
                     }
                 }
-                /// Scans all words with split main and tail loops for speed.
+                /// Scans words inside an optional bit range in walk order.
                 /// - `data` - bitset and caller context.
+                /// - `start_bit` - range edge or null for no lower limit.
+                /// - `end_bit` - range edge or null for no upper limit.
                 ///
                 /// Return - false on early exit, true when the scan completed.
-                pub inline fn iterateAll(data: BitsetWithContext(Context)) bool {
+                pub inline fn iterateAll(data: BitsetWithContext(Context), start_bit: ?u32, end_bit: ?u32) bool {
                     const bitset = data.bitset;
                     const context = data.context;
                     const words = bitset.words.items;
-                    const total = bitset.bits_count;
                     if (words.len == 0) return true;
+                    const range = utilities.resolveRange(bitset.bits_count, start_bit, end_bit);
+                    if (range.lo >= range.hi) return true;
+                    const lo_word: usize = @intCast(bw.bitToWordId(range.lo));
+                    const hi_word: usize = @intCast(bw.bitToWordId(range.hi - 1));
 
                     if (on_active) |f| {
                         if (on_inactive == null) {
-                            var wid: usize = 0;
-                            while (wid + 1 < words.len) : (wid += 1) {
-                                const base: u32 = @truncate(wid * bw.word_type_bits);
-                                if (!flatPeelWord(context, base, words[wid], f)) return false;
+                            var wid: usize = if (direction == .forward) lo_word else hi_word;
+                            while (true) {
+                                const w = words[wid] & wordRangeMask(wid, range.lo, range.hi);
+                                const base = bw.wordToBitId(@truncate(wid));
+                                const ok = if (direction == .forward)
+                                    flatPeelWord(context, base, w, f)
+                                else
+                                    flatPeelWordReverse(context, base, w, f);
+                                if (!ok) return false;
+                                if (wid == (if (direction == .forward) hi_word else lo_word)) break;
+                                wid = if (direction == .forward) wid + 1 else wid - 1;
                             }
-                            const last = words.len - 1;
-                            const base: u32 = @truncate(last * bw.word_type_bits);
-                            var w = words[last];
-                            const used = bw.bitIdInWord(total);
-                            if (used != 0) w &= bw.maskStart(used);
-                            return flatPeelWord(context, base, w, f);
+                            return true;
                         }
                     }
 
                     if (on_inactive) |f| {
                         if (on_active == null) {
-                            var wid: usize = 0;
-                            while (wid + 1 < words.len) : (wid += 1) {
-                                const base: u32 = @truncate(wid * bw.word_type_bits);
-                                if (!flatPeelWord(context, base, ~words[wid], f)) return false;
+                            var wid: usize = if (direction == .forward) lo_word else hi_word;
+                            while (true) {
+                                const w = ~words[wid] & wordRangeMask(wid, range.lo, range.hi);
+                                const base = bw.wordToBitId(@truncate(wid));
+                                const ok = if (direction == .forward)
+                                    flatPeelWord(context, base, w, f)
+                                else
+                                    flatPeelWordReverse(context, base, w, f);
+                                if (!ok) return false;
+                                if (wid == (if (direction == .forward) hi_word else lo_word)) break;
+                                wid = if (direction == .forward) wid + 1 else wid - 1;
                             }
-                            const last = words.len - 1;
-                            const base: u32 = @truncate(last * bw.word_type_bits);
-                            var w = ~words[last];
-                            const used = bw.bitIdInWord(total);
-                            if (used != 0) w &= bw.maskStart(used);
-                            return flatPeelWord(context, base, w, f);
+                            return true;
                         }
                     }
 
-                    var wid: usize = 0;
-                    while (wid + 1 < words.len) : (wid += 1) {
-                        const base: u32 = @truncate(wid * bw.word_type_bits);
-                        if (!flatMergeWord(context, base, words[wid], bw.word_type_bits)) return false;
+                    var wid: usize = if (direction == .forward) lo_word else hi_word;
+                    while (true) {
+                        const w_base = bw.wordToBitId(@truncate(wid));
+                        const s = @max(range.lo, w_base) - w_base;
+                        const e = @min(range.hi, w_base + bw.word_type_bits) - w_base;
+                        if (!flatMergeWord(context, w_base, words[wid], s, e)) return false;
+                        if (wid == (if (direction == .forward) hi_word else lo_word)) break;
+                        wid = if (direction == .forward) wid + 1 else wid - 1;
                     }
-                    const last = words.len - 1;
-                    const base: u32 = @truncate(last * bw.word_type_bits);
-                    const used = bw.bitIdInWord(total);
-                    const bound: u32 = if (used != 0) used else bw.word_type_bits;
-                    return flatMergeWord(context, base, words[last], bound);
+                    return true;
+                }
+
+                /// Keeps only range-covered lanes of one word, padding excluded.
+                /// - `word_id` - word index to mask.
+                /// - `lo` - resolved range start, inclusive.
+                /// - `hi` - resolved range end, exclusive.
+                ///
+                /// Return - mask with exactly the visited lanes set.
+                inline fn wordRangeMask(word_id: usize, lo: u32, hi: u32) Word {
+                    const w_base = bw.wordToBitId(@truncate(word_id));
+                    const s = @max(lo, w_base) - w_base;
+                    const e = @min(hi, w_base + bw.word_type_bits) - w_base;
+                    return rangeMask(s, e);
                 }
 
                 /// Fast path when both callbacks exist, merges by bound linearly.
@@ -147,7 +170,7 @@ pub fn Bitset(comptime wt: WordType) type {
                         const used = bw.bitIdInWord(bitset.bits_count);
                         if (used != 0) bound = used;
                     }
-                    return flatMergeWord(context, start, word, bound);
+                    return flatMergeWord(context, start, word, 0, bound);
                 }
 
                 /// Selective path that peels only sides with installed callbacks.
@@ -172,25 +195,23 @@ pub fn Bitset(comptime wt: WordType) type {
 
                     if (on_active) |f| {
                         if (on_inactive == null) {
-                            var only_active_word = word & mask;
-                            while (only_active_word != 0) {
-                                const bit_id_in_word: u32 = @ctz(only_active_word);
-                                only_active_word &= only_active_word - 1;
-                                if (!f(context, start + bit_id_in_word)) return false;
-                            }
-                            return true;
+                            const only_active_word = word & mask;
+                            const ok = if (direction == .forward)
+                                flatPeelWord(context, start, only_active_word, f)
+                            else
+                                flatPeelWordReverse(context, start, only_active_word, f);
+                            return ok;
                         }
                     }
 
                     if (on_inactive) |f| {
                         if (on_active == null) {
-                            var only_inactive_word = (~word) & mask;
-                            while (only_inactive_word != 0) {
-                                const bit_id_in_word: u32 = @ctz(only_inactive_word);
-                                only_inactive_word &= only_inactive_word - 1;
-                                if (!f(context, start + bit_id_in_word)) return false;
-                            }
-                            return true;
+                            const only_inactive_word = (~word) & mask;
+                            const ok = if (direction == .forward)
+                                flatPeelWord(context, start, only_inactive_word, f)
+                            else
+                                flatPeelWordReverse(context, start, only_inactive_word, f);
+                            return ok;
                         }
                     }
 
@@ -201,23 +222,47 @@ pub fn Bitset(comptime wt: WordType) type {
                     if (on_active != null) pending_word |= only_active_word;
                     if (on_inactive != null) pending_word |= only_inactive_word;
 
-                    while (pending_word != 0) {
-                        const bit_id_in_word: u32 = @ctz(pending_word);
-                        const bit_id = start + bit_id_in_word;
-                        const bit: Word = @as(Word, 1) << @truncate(bit_id_in_word);
-                        pending_word &= pending_word - 1;
+                    if (direction == .forward) {
+                        while (pending_word != 0) {
+                            const bit_id_in_word: u32 = @ctz(pending_word);
+                            const bit_id = start + bit_id_in_word;
+                            const bit: Word = @as(Word, 1) << @truncate(bit_id_in_word);
+                            pending_word &= pending_word - 1;
 
-                        if (on_active) |f| {
-                            if ((only_active_word & bit) != 0) {
-                                if (!f(context, bit_id)) return false;
-                                continue;
+                            if (on_active) |f| {
+                                if ((only_active_word & bit) != 0) {
+                                    if (!f(context, bit_id)) return false;
+                                    continue;
+                                }
+                            }
+
+                            if (on_inactive) |f| {
+                                if ((only_inactive_word & bit) != 0) {
+                                    if (!f(context, bit_id)) return false;
+                                    continue;
+                                }
                             }
                         }
+                    } else {
+                        while (pending_word != 0) {
+                            const lz: u32 = @clz(pending_word);
+                            const bit_id_in_word = bw.word_type_bits - 1 - lz;
+                            const bit_id = start + bit_id_in_word;
+                            const bit: Word = @as(Word, 1) << @truncate(bit_id_in_word);
+                            pending_word ^= bit;
 
-                        if (on_inactive) |f| {
-                            if ((only_inactive_word & bit) != 0) {
-                                if (!f(context, bit_id)) return false;
-                                continue;
+                            if (on_active) |f| {
+                                if ((only_active_word & bit) != 0) {
+                                    if (!f(context, bit_id)) return false;
+                                    continue;
+                                }
+                            }
+
+                            if (on_inactive) |f| {
+                                if ((only_inactive_word & bit) != 0) {
+                                    if (!f(context, bit_id)) return false;
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -247,28 +292,82 @@ pub fn Bitset(comptime wt: WordType) type {
                     return true;
                 }
 
+                /// Peels one masked word into a single callback in reverse bit order.
+                /// - `context` - caller context for the callback.
+                /// - `base` - global id of the word start.
+                /// - `word` - pre-masked word to peel.
+                /// - `f` - inline visitor, false stops the walk.
+                ///
+                /// Return - false on early exit, true when the word completed.
+                inline fn flatPeelWordReverse(
+                    context: Context,
+                    base: u32,
+                    word: Word,
+                    comptime f: fn (context: Context, bit_id: u32) callconv(.@"inline") bool,
+                ) bool {
+                    var w = word;
+                    while (w != 0) {
+                        const lz: u32 = @clz(w);
+                        const bit_id_in_word = bw.word_type_bits - 1 - lz;
+                        w ^= @as(Word, 1) << @truncate(bit_id_in_word);
+                        if (!f(context, base + bit_id_in_word)) return false;
+                    }
+                    return true;
+                }
+
+                /// Builds a mask keeping exactly the `[s, e)` lanes of one word.
+                /// - `s` - first kept lane, inclusive.
+                /// - `e` - one past the last kept lane, exclusive.
+                ///
+                /// Return - mask with only the sub-range lanes set.
+                inline fn rangeMask(s: u32, e: u32) Word {
+                    if (s >= e) return 0;
+                    var m: Word = bw.max_value;
+                    if (s != 0) m &= bw.max_value << @truncate(s);
+                    if (e != bw.word_type_bits) m &= ~(bw.max_value << @truncate(e));
+                    return m;
+                }
+
                 /// Merges one bounded word into active and inactive callbacks linearly.
                 /// - `context` - caller context for the callbacks.
                 /// - `base` - global id of the word start.
                 /// - `word` - raw word to classify bit by bit.
-                /// - `valid_len` - valid bits in the word, bounds the scan.
+                /// - `sub_lo` - first classified lane, inclusive.
+                /// - `sub_hi` - one past the last classified lane, exclusive.
                 ///
                 /// Return - false on early exit, true when the word completed.
                 inline fn flatMergeWord(
                     context: Context,
                     base: u32,
                     word: Word,
-                    valid_len: u32,
+                    sub_lo: u32,
+                    sub_hi: u32,
                 ) bool {
-                    var i: u32 = 0;
-                    while (i < valid_len) : (i += 1) {
-                        if (((word >> @truncate(i)) & 1) != 0) {
-                            if (on_active) |f| {
-                                if (!f(context, base + i)) return false;
+                    if (direction == .forward) {
+                        var i: u32 = sub_lo;
+                        while (i < sub_hi) : (i += 1) {
+                            if (((word >> @truncate(i)) & 1) != 0) {
+                                if (on_active) |f| {
+                                    if (!f(context, base + i)) return false;
+                                }
+                            } else {
+                                if (on_inactive) |f| {
+                                    if (!f(context, base + i)) return false;
+                                }
                             }
-                        } else {
-                            if (on_inactive) |f| {
-                                if (!f(context, base + i)) return false;
+                        }
+                    } else {
+                        var i: u32 = sub_hi;
+                        while (i > sub_lo) {
+                            i -= 1;
+                            if (((word >> @truncate(i)) & 1) != 0) {
+                                if (on_active) |f| {
+                                    if (!f(context, base + i)) return false;
+                                }
+                            } else {
+                                if (on_inactive) |f| {
+                                    if (!f(context, base + i)) return false;
+                                }
                             }
                         }
                     }
@@ -284,6 +383,7 @@ pub fn Bitset(comptime wt: WordType) type {
             comptime Context: type,
             comptime on_active: InlineIteratorCallback(Context),
             comptime on_inactive: InlineIteratorCallback(Context),
+            comptime direction: utilities.Direction,
         ) type {
             return struct {
                 /// Visits one word and routes each valid bit to its callback.
@@ -299,62 +399,86 @@ pub fn Bitset(comptime wt: WordType) type {
                         return stepPending(data, word_id);
                     }
                 }
-                /// Scans all words with split main and tail loops for speed.
+                /// Scans words inside an optional bit range in walk order.
                 /// - `data` - bitsets and caller context.
+                /// - `start_bit` - range edge or null for no lower limit.
+                /// - `end_bit` - range edge or null for no upper limit.
                 ///
                 /// Return - false on early exit, true when the scan completed.
-                pub inline fn iterateAll(data: BitsetsWithContext(include_len, exclude_len, Context)) bool {
+                pub inline fn iterateAll(data: BitsetsWithContext(include_len, exclude_len, Context), start_bit: ?u32, end_bit: ?u32) bool {
                     if (include_len == 0 and exclude_len == 0) return true;
                     const first = if (include_len > 0) data.includes[0] else data.excludes[0];
                     const context = data.context;
-                    const words_len = first.words.items.len;
-                    const total = first.bits_count;
-                    if (words_len == 0) return true;
+                    if (first.words.items.len == 0) return true;
+                    const range = utilities.resolveRange(first.bits_count, start_bit, end_bit);
+                    if (range.lo >= range.hi) return true;
+                    const lo_word: usize = @intCast(bw.bitToWordId(range.lo));
+                    const hi_word: usize = @intCast(bw.bitToWordId(range.hi - 1));
 
                     if (on_active) |f| {
                         if (on_inactive == null) {
-                            var wid: usize = 0;
-                            while (wid + 1 < words_len) : (wid += 1) {
-                                const base: u32 = @truncate(wid * bw.word_type_bits);
-                                if (!flatPeelWord(context, base, commonActiveWord(data, @truncate(wid)), f)) return false;
+                            var wid: usize = if (direction == .forward) lo_word else hi_word;
+                            while (true) {
+                                const word_id: u32 = @truncate(wid);
+                                const w = commonActiveWord(data, word_id) & wordRangeMask(first, wid, range.lo, range.hi);
+                                const base = bw.wordToBitId(word_id);
+                                const ok = if (direction == .forward)
+                                    flatPeelWord(context, base, w, f)
+                                else
+                                    flatPeelWordReverse(context, base, w, f);
+                                if (!ok) return false;
+                                if (wid == (if (direction == .forward) hi_word else lo_word)) break;
+                                wid = if (direction == .forward) wid + 1 else wid - 1;
                             }
-                            const last = words_len - 1;
-                            const base: u32 = @truncate(last * bw.word_type_bits);
-                            var w = commonActiveWord(data, @truncate(last));
-                            const used = bw.bitIdInWord(total);
-                            if (used != 0) w &= bw.maskStart(used);
-                            return flatPeelWord(context, base, w, f);
+                            return true;
                         }
                     }
 
                     if (on_inactive) |f| {
                         if (on_active == null) {
-                            var wid: usize = 0;
-                            while (wid + 1 < words_len) : (wid += 1) {
-                                const base: u32 = @truncate(wid * bw.word_type_bits);
-                                if (!flatPeelWord(context, base, commonInactiveWord(data, @truncate(wid)), f)) return false;
+                            var wid: usize = if (direction == .forward) lo_word else hi_word;
+                            while (true) {
+                                const word_id: u32 = @truncate(wid);
+                                const w = commonInactiveWord(data, word_id) & wordRangeMask(first, wid, range.lo, range.hi);
+                                const base = bw.wordToBitId(word_id);
+                                const ok = if (direction == .forward)
+                                    flatPeelWord(context, base, w, f)
+                                else
+                                    flatPeelWordReverse(context, base, w, f);
+                                if (!ok) return false;
+                                if (wid == (if (direction == .forward) hi_word else lo_word)) break;
+                                wid = if (direction == .forward) wid + 1 else wid - 1;
                             }
-                            const last = words_len - 1;
-                            const base: u32 = @truncate(last * bw.word_type_bits);
-                            var w = commonInactiveWord(data, @truncate(last));
-                            const used = bw.bitIdInWord(total);
-                            if (used != 0) w &= bw.maskStart(used);
-                            return flatPeelWord(context, base, w, f);
+                            return true;
                         }
                     }
 
-                    var wid: usize = 0;
-                    while (wid + 1 < words_len) : (wid += 1) {
-                        const base: u32 = @truncate(wid * bw.word_type_bits);
+                    var wid: usize = if (direction == .forward) lo_word else hi_word;
+                    while (true) {
                         const word_id: u32 = @truncate(wid);
-                        if (!flatMergeWord(context, base, commonActiveWord(data, word_id), commonInactiveWord(data, word_id), bw.word_type_bits)) return false;
+                        const w_base = bw.wordToBitId(word_id);
+                        const s = @max(range.lo, w_base) - w_base;
+                        const e = @min(range.hi, w_base + bw.word_type_bits) - w_base;
+                        if (!flatMergeWord(context, w_base, commonActiveWord(data, word_id), commonInactiveWord(data, word_id), s, e)) return false;
+                        if (wid == (if (direction == .forward) hi_word else lo_word)) break;
+                        wid = if (direction == .forward) wid + 1 else wid - 1;
                     }
-                    const last = words_len - 1;
-                    const base: u32 = @truncate(last * bw.word_type_bits);
-                    const used = bw.bitIdInWord(total);
-                    const bound: u32 = if (used != 0) used else bw.word_type_bits;
-                    const word_id: u32 = @truncate(last);
-                    return flatMergeWord(context, base, commonActiveWord(data, word_id), commonInactiveWord(data, word_id), bound);
+                    return true;
+                }
+
+                /// Keeps only range-covered lanes of one word, padding excluded.
+                /// - `first` - bounds source for the range, any merged bitset.
+                /// - `word_id` - word index to mask.
+                /// - `lo` - resolved range start, inclusive.
+                /// - `hi` - resolved range end, exclusive.
+                ///
+                /// Return - mask with exactly the visited lanes set.
+                inline fn wordRangeMask(first: *Self, word_id: usize, lo: u32, hi: u32) Word {
+                    _ = first;
+                    const w_base = bw.wordToBitId(@truncate(word_id));
+                    const s = @max(lo, w_base) - w_base;
+                    const e = @min(hi, w_base + bw.word_type_bits) - w_base;
+                    return rangeMask(s, e);
                 }
 
                 /// Fast path when both callbacks exist, merges by bound linearly.
@@ -374,7 +498,7 @@ pub fn Bitset(comptime wt: WordType) type {
                         const used = bw.bitIdInWord(first.bits_count);
                         if (used != 0) bound = used;
                     }
-                    return flatMergeWord(context, start, active_mask, inactive_mask, bound);
+                    return flatMergeWord(context, start, active_mask, inactive_mask, 0, bound);
                 }
 
                 /// Selective path that peels only sides with installed callbacks.
@@ -397,25 +521,23 @@ pub fn Bitset(comptime wt: WordType) type {
 
                     if (on_active) |f| {
                         if (on_inactive == null) {
-                            var only_active_word = commonActiveWord(data, word_id) & mask;
-                            while (only_active_word != 0) {
-                                const bit_id_in_word: u32 = @ctz(only_active_word);
-                                only_active_word &= only_active_word - 1;
-                                if (!f(context, start + bit_id_in_word)) return false;
-                            }
-                            return true;
+                            const only_active_word = commonActiveWord(data, word_id) & mask;
+                            const ok = if (direction == .forward)
+                                flatPeelWord(context, start, only_active_word, f)
+                            else
+                                flatPeelWordReverse(context, start, only_active_word, f);
+                            return ok;
                         }
                     }
 
                     if (on_inactive) |f| {
                         if (on_active == null) {
-                            var only_inactive_word = commonInactiveWord(data, word_id) & mask;
-                            while (only_inactive_word != 0) {
-                                const bit_id_in_word: u32 = @ctz(only_inactive_word);
-                                only_inactive_word &= only_inactive_word - 1;
-                                if (!f(context, start + bit_id_in_word)) return false;
-                            }
-                            return true;
+                            const only_inactive_word = commonInactiveWord(data, word_id) & mask;
+                            const ok = if (direction == .forward)
+                                flatPeelWord(context, start, only_inactive_word, f)
+                            else
+                                flatPeelWordReverse(context, start, only_inactive_word, f);
+                            return ok;
                         }
                     }
 
@@ -426,23 +548,47 @@ pub fn Bitset(comptime wt: WordType) type {
                     if (on_active != null) pending_word |= only_active_word;
                     if (on_inactive != null) pending_word |= only_inactive_word;
 
-                    while (pending_word != 0) {
-                        const bit_id_in_word: u32 = @ctz(pending_word);
-                        const bit_id = start + bit_id_in_word;
-                        const bit: Word = @as(Word, 1) << @truncate(bit_id_in_word);
-                        pending_word &= pending_word - 1;
+                    if (direction == .forward) {
+                        while (pending_word != 0) {
+                            const bit_id_in_word: u32 = @ctz(pending_word);
+                            const bit_id = start + bit_id_in_word;
+                            const bit: Word = @as(Word, 1) << @truncate(bit_id_in_word);
+                            pending_word &= pending_word - 1;
 
-                        if (on_active) |f| {
-                            if ((only_active_word & bit) != 0) {
-                                if (!f(context, bit_id)) return false;
-                                continue;
+                            if (on_active) |f| {
+                                if ((only_active_word & bit) != 0) {
+                                    if (!f(context, bit_id)) return false;
+                                    continue;
+                                }
+                            }
+
+                            if (on_inactive) |f| {
+                                if ((only_inactive_word & bit) != 0) {
+                                    if (!f(context, bit_id)) return false;
+                                    continue;
+                                }
                             }
                         }
+                    } else {
+                        while (pending_word != 0) {
+                            const lz: u32 = @clz(pending_word);
+                            const bit_id_in_word = bw.word_type_bits - 1 - lz;
+                            const bit_id = start + bit_id_in_word;
+                            const bit: Word = @as(Word, 1) << @truncate(bit_id_in_word);
+                            pending_word ^= bit;
 
-                        if (on_inactive) |f| {
-                            if ((only_inactive_word & bit) != 0) {
-                                if (!f(context, bit_id)) return false;
-                                continue;
+                            if (on_active) |f| {
+                                if ((only_active_word & bit) != 0) {
+                                    if (!f(context, bit_id)) return false;
+                                    continue;
+                                }
+                            }
+
+                            if (on_inactive) |f| {
+                                if ((only_inactive_word & bit) != 0) {
+                                    if (!f(context, bit_id)) return false;
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -506,12 +652,49 @@ pub fn Bitset(comptime wt: WordType) type {
                     return true;
                 }
 
+                /// Peels one masked word into a single callback in reverse bit order.
+                /// - `context` - caller context for the callback.
+                /// - `base` - global id of the word start.
+                /// - `word` - pre-masked word to peel.
+                /// - `f` - inline visitor, false stops the walk.
+                ///
+                /// Return - false on early exit, true when the word completed.
+                inline fn flatPeelWordReverse(
+                    context: Context,
+                    base: u32,
+                    word: Word,
+                    comptime f: fn (context: Context, bit_id: u32) callconv(.@"inline") bool,
+                ) bool {
+                    var w = word;
+                    while (w != 0) {
+                        const lz: u32 = @clz(w);
+                        const bit_id_in_word = bw.word_type_bits - 1 - lz;
+                        w ^= @as(Word, 1) << @truncate(bit_id_in_word);
+                        if (!f(context, base + bit_id_in_word)) return false;
+                    }
+                    return true;
+                }
+
+                /// Builds a mask keeping exactly the `[s, e)` lanes of one word.
+                /// - `s` - first kept lane, inclusive.
+                /// - `e` - one past the last kept lane, exclusive.
+                ///
+                /// Return - mask with only the sub-range lanes set.
+                inline fn rangeMask(s: u32, e: u32) Word {
+                    if (s >= e) return 0;
+                    var m: Word = bw.max_value;
+                    if (s != 0) m &= bw.max_value << @truncate(s);
+                    if (e != bw.word_type_bits) m &= ~(bw.max_value << @truncate(e));
+                    return m;
+                }
+
                 /// Merges one bounded word into active and inactive callbacks linearly.
                 /// - `context` - caller context for the callbacks.
                 /// - `base` - global id of the word start.
                 /// - `active_mask` - pre-merged active lanes to visit.
                 /// - `inactive_mask` - pre-merged inactive lanes to visit.
-                /// - `valid_len` - valid bits in the word, bounds the scan.
+                /// - `sub_lo` - first classified lane, inclusive.
+                /// - `sub_hi` - one past the last classified lane, exclusive.
                 ///
                 /// Return - false on early exit, true when the word completed.
                 inline fn flatMergeWord(
@@ -519,17 +702,34 @@ pub fn Bitset(comptime wt: WordType) type {
                     base: u32,
                     active_mask: Word,
                     inactive_mask: Word,
-                    valid_len: u32,
+                    sub_lo: u32,
+                    sub_hi: u32,
                 ) bool {
-                    var i: u32 = 0;
-                    while (i < valid_len) : (i += 1) {
-                        if (((active_mask >> @truncate(i)) & 1) != 0) {
-                            if (on_active) |f| {
-                                if (!f(context, base + i)) return false;
+                    if (direction == .forward) {
+                        var i: u32 = sub_lo;
+                        while (i < sub_hi) : (i += 1) {
+                            if (((active_mask >> @truncate(i)) & 1) != 0) {
+                                if (on_active) |f| {
+                                    if (!f(context, base + i)) return false;
+                                }
+                            } else if (((inactive_mask >> @truncate(i)) & 1) != 0) {
+                                if (on_inactive) |f| {
+                                    if (!f(context, base + i)) return false;
+                                }
                             }
-                        } else if (((inactive_mask >> @truncate(i)) & 1) != 0) {
-                            if (on_inactive) |f| {
-                                if (!f(context, base + i)) return false;
+                        }
+                    } else {
+                        var i: u32 = sub_hi;
+                        while (i > sub_lo) {
+                            i -= 1;
+                            if (((active_mask >> @truncate(i)) & 1) != 0) {
+                                if (on_active) |f| {
+                                    if (!f(context, base + i)) return false;
+                                }
+                            } else if (((inactive_mask >> @truncate(i)) & 1) != 0) {
+                                if (on_inactive) |f| {
+                                    if (!f(context, base + i)) return false;
+                                }
                             }
                         }
                     }
@@ -1211,7 +1411,7 @@ inline fn stepPushI(ctx: *StepIds, bit_id: u32) bool {
 }
 
 fn stepCollectAll(comptime wt: WordType, bs: *Bitset(wt), ctx: *StepIds) bool {
-    const It = Bitset(wt).Iterator(*StepIds, stepPushA, stepPushI);
+    const It = Bitset(wt).Iterator(*StepIds, stepPushA, stepPushI, .forward);
     var wid: u32 = 0;
     while (wid < bs.words.items.len) : (wid += 1) {
         if (!It.step(.{ .bitset = bs, .context = ctx }, wid)) return false;
@@ -1282,7 +1482,7 @@ test "Bitset step: null side is skipped" {
         try bs.resize(t.allocator, 70, .inactive);
         bs.setBit(5, .active);
         bs.setBit(69, .active);
-        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, null);
+        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, null, .forward);
         var ctx = StepIds{};
         try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 0));
         try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 1));
@@ -1295,7 +1495,7 @@ test "Bitset step: null side is skipped" {
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 10, .active);
         bs.setBit(3, .inactive);
-        const It = Bitset(.u8).Iterator(*StepIds, null, stepPushI);
+        const It = Bitset(.u8).Iterator(*StepIds, null, stepPushI, .forward);
         var ctx = StepIds{};
         try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 0));
         try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 1));
@@ -1309,7 +1509,7 @@ test "Bitset step: early exit stops the walk" {
         var bs = Bitset(.u64){};
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 70, .active);
-        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, stepPushI, .forward);
         var ctx = StepIds{ .stop_after = 3 };
         try t.expect(!It.step(.{ .bitset = &bs, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 3), ctx.na);
@@ -1323,7 +1523,7 @@ test "Bitset step: early exit stops the walk" {
         try bs.resize(t.allocator, 10, .inactive);
         bs.setBit(0, .active);
         bs.setBit(9, .active);
-        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, stepPushI, .forward);
         var ctx = StepIds{ .stop_after = 4 };
 
         try t.expect(!It.step(.{ .bitset = &bs, .context = &ctx }, 0));
@@ -1335,7 +1535,7 @@ test "Bitset step: early exit stops the walk" {
         var bs = Bitset(.u64){};
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 130, .active);
-        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, stepPushI, .forward);
         var ctx = StepIds{ .stop_after = 70 };
         try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 64), ctx.na);
@@ -1349,7 +1549,7 @@ test "Bitset step: early exit stops the walk" {
         var bs = Bitset(.u64){};
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 10, .active);
-        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, stepPushI, .forward);
         var ctx = StepIds{ .stop_after = 1 };
         try t.expect(!It.step(.{ .bitset = &bs, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 1), ctx.na);
@@ -1357,8 +1557,8 @@ test "Bitset step: early exit stops the walk" {
 }
 
 fn iterateAllCollect(comptime wt: WordType, bs: *Bitset(wt), ctx: *StepIds) bool {
-    const It = Bitset(wt).Iterator(*StepIds, stepPushA, stepPushI);
-    return It.iterateAll(.{ .bitset = bs, .context = ctx });
+    const It = Bitset(wt).Iterator(*StepIds, stepPushA, stepPushI, .forward);
+    return It.iterateAll(.{ .bitset = bs, .context = ctx }, null, null);
 }
 
 test "Bitset iterateAll: parity with per-word step + oracle" {
@@ -1430,7 +1630,7 @@ fn commonStepCollect(
     excludes: [EL]*Bitset(wt),
     ctx: *StepIds,
 ) bool {
-    const It = Bitset(wt).CommonIterator(IL, EL, *StepIds, on_a, on_i);
+    const It = Bitset(wt).CommonIterator(IL, EL, *StepIds, on_a, on_i, .forward);
     if (IL == 0 and EL == 0) return true;
     const words_len = if (IL > 0) includes[0].words.items.len else excludes[0].words.items.len;
     var wid: u32 = 0;
@@ -1450,8 +1650,8 @@ fn commonIterateAllCollect(
     excludes: [EL]*Bitset(wt),
     ctx: *StepIds,
 ) bool {
-    const It = Bitset(wt).CommonIterator(IL, EL, *StepIds, on_a, on_i);
-    return It.iterateAll(.{ .includes = includes, .excludes = excludes, .context = ctx });
+    const It = Bitset(wt).CommonIterator(IL, EL, *StepIds, on_a, on_i, .forward);
+    return It.iterateAll(.{ .includes = includes, .excludes = excludes, .context = ctx }, null, null);
 }
 
 fn commonStepCollectOrder(
@@ -1462,7 +1662,7 @@ fn commonStepCollectOrder(
     excludes: [EL]*Bitset(wt),
     ctx: *CommonOrderIds,
 ) bool {
-    const It = Bitset(wt).CommonIterator(IL, EL, *CommonOrderIds, commonOrderPushA, commonOrderPushI);
+    const It = Bitset(wt).CommonIterator(IL, EL, *CommonOrderIds, commonOrderPushA, commonOrderPushI, .forward);
     if (IL == 0 and EL == 0) return true;
     const words_len = if (IL > 0) includes[0].words.items.len else excludes[0].words.items.len;
     var wid: u32 = 0;
@@ -1658,37 +1858,37 @@ test "Bitset CommonIterator: spec example 2+2" {
     const exc_ptrs: [2]*Bitset(.u8) = .{ &exc0, &exc1 };
 
     {
-        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, stepPushA, stepPushI, .forward);
         var ctx = StepIds{};
         try t.expect(It.step(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ctx }, 0));
         try t.expectEqualSlices(u32, &[_]u32{1}, ctx.active[0..ctx.na]);
         try t.expectEqualSlices(u32, &[_]u32{0}, ctx.inactive[0..ctx.ni]);
     }
     {
-        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, stepPushA, stepPushI, .forward);
         var ctx = StepIds{};
-        try t.expect(It.iterateAll(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ctx }));
+        try t.expect(It.iterateAll(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ctx }, null, null));
         try t.expectEqualSlices(u32, &[_]u32{1}, ctx.active[0..ctx.na]);
         try t.expectEqualSlices(u32, &[_]u32{0}, ctx.inactive[0..ctx.ni]);
     }
     {
-        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, stepPushA, null);
+        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, stepPushA, null, .forward);
         var ctx = StepIds{};
         try t.expect(It.step(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ctx }, 0));
         try t.expectEqualSlices(u32, &[_]u32{1}, ctx.active[0..ctx.na]);
         try t.expectEqual(@as(usize, 0), ctx.ni);
         var ctx2 = StepIds{};
-        try t.expect(It.iterateAll(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ctx2 }));
+        try t.expect(It.iterateAll(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ctx2 }, null, null));
         try t.expectEqualSlices(u32, &[_]u32{1}, ctx2.active[0..ctx2.na]);
     }
     {
-        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, null, stepPushI);
+        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, null, stepPushI, .forward);
         var ctx = StepIds{};
         try t.expect(It.step(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ctx }, 0));
         try t.expectEqualSlices(u32, &[_]u32{0}, ctx.inactive[0..ctx.ni]);
         try t.expectEqual(@as(usize, 0), ctx.na);
         var ctx2 = StepIds{};
-        try t.expect(It.iterateAll(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ctx2 }));
+        try t.expect(It.iterateAll(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ctx2 }, null, null));
         try t.expectEqualSlices(u32, &[_]u32{0}, ctx2.inactive[0..ctx2.ni]);
     }
 }
@@ -1705,7 +1905,7 @@ test "Bitset CommonIterator: 1+1 truth table" {
     inc.active_bits_counter = @popCount(inc.words.items[0]);
     exc.active_bits_counter = @popCount(exc.words.items[0]);
 
-    const It = Bitset(.u8).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
+    const It = Bitset(.u8).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI, .forward);
     var ctx = StepIds{};
     try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
     try t.expectEqualSlices(u32, &[_]u32{2}, ctx.active[0..ctx.na]);
@@ -1772,7 +1972,7 @@ fn commonCheckSingleMatchesIterator(comptime wt: WordType, n: u32, pat: ResizePa
         try t.expectEqualSlices(u32, a.inactive[0..a.ni], b.inactive[0..b.ni]);
     }
     {
-        const It = Bitset(wt).Iterator(*StepIds, stepPushA, stepPushI);
+        const It = Bitset(wt).Iterator(*StepIds, stepPushA, stepPushI, .forward);
         var ref = StepIds{};
         var wid: u32 = 0;
         while (wid < bs.words.items.len) : (wid += 1) {
@@ -2141,7 +2341,7 @@ test "Bitset CommonIterator: early exit stops the walk" {
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 70, .active);
         try exc.resize(t.allocator, 70, .inactive);
-        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI, .forward);
         var ctx = StepIds{ .stop_after = 3 };
         try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 3), ctx.na);
@@ -2157,7 +2357,7 @@ test "Bitset CommonIterator: early exit stops the walk" {
         try exc.resize(t.allocator, 10, .inactive);
         inc.setBit(0, .active);
         exc.setBit(5, .active);
-        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI, .forward);
         var ctx = StepIds{ .stop_after = 2 };
         try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqualSlices(u32, &[_]u32{0}, ctx.active[0..ctx.na]);
@@ -2170,7 +2370,7 @@ test "Bitset CommonIterator: early exit stops the walk" {
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 130, .active);
         try exc.resize(t.allocator, 130, .inactive);
-        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI, .forward);
         var ctx = StepIds{ .stop_after = 70 };
         try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 64), ctx.na);
@@ -2186,7 +2386,7 @@ test "Bitset CommonIterator: early exit stops the walk" {
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 10, .active);
         try exc.resize(t.allocator, 10, .inactive);
-        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI, .forward);
         var ctx = StepIds{ .stop_after = 1 };
         try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 1), ctx.na);
@@ -2208,7 +2408,7 @@ test "Bitset CommonIterator: early exit stops the walk" {
         inc1.words.items[0] = 0b0110_1110;
         exc0.words.items[0] = 0b1100_0101;
         exc1.words.items[0] = 0b0001_1101;
-        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, stepPushA, stepPushI, .forward);
         var ctx = StepIds{ .stop_after = 1 };
         try t.expect(!It.step(.{ .includes = .{ &inc0, &inc1 }, .excludes = .{ &exc0, &exc1 }, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 0), ctx.na);
@@ -2219,7 +2419,7 @@ test "Bitset CommonIterator: early exit stops the walk" {
         try t.expectEqual(@as(usize, 1), ctx2.na);
         try t.expectEqual(@as(usize, 1), ctx2.ni);
         var ctx3 = StepIds{ .stop_after = 5 };
-        try t.expect(It.iterateAll(.{ .includes = .{ &inc0, &inc1 }, .excludes = .{ &exc0, &exc1 }, .context = &ctx3 }));
+        try t.expect(It.iterateAll(.{ .includes = .{ &inc0, &inc1 }, .excludes = .{ &exc0, &exc1 }, .context = &ctx3 }, null, null));
         try t.expectEqual(@as(usize, 1), ctx3.na);
         try t.expectEqual(@as(usize, 1), ctx3.ni);
     }
@@ -2230,9 +2430,9 @@ test "Bitset CommonIterator: early exit stops the walk" {
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 130, .active);
         try exc.resize(t.allocator, 130, .inactive);
-        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI, .forward);
         var ctx = StepIds{ .stop_after = 70 };
-        try t.expect(!It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }));
+        try t.expect(!It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, null, null));
         try t.expectEqual(@as(usize, 70), ctx.na);
     }
     {
@@ -2242,17 +2442,17 @@ test "Bitset CommonIterator: early exit stops the walk" {
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 130, .inactive);
         try exc.resize(t.allocator, 130, .active);
-        const ItI = Bitset(.u64).CommonIterator(1, 1, *StepIds, null, stepPushI);
+        const ItI = Bitset(.u64).CommonIterator(1, 1, *StepIds, null, stepPushI, .forward);
         var only_i = StepIds{ .stop_after = 1 };
-        try t.expect(!ItI.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &only_i }));
+        try t.expect(!ItI.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &only_i }, null, null));
         try t.expectEqual(@as(usize, 1), only_i.ni);
         try t.expectEqual(@as(u32, 0), only_i.inactive[0]);
         var only_i_full = StepIds{};
-        try t.expect(ItI.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &only_i_full }));
+        try t.expect(ItI.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &only_i_full }, null, null));
         try t.expectEqual(@as(usize, 130), only_i_full.ni);
-        const ItA = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, null);
+        const ItA = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, null, .forward);
         var only_a_full = StepIds{};
-        try t.expect(ItA.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &only_a_full }));
+        try t.expect(ItA.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &only_a_full }, null, null));
         try t.expectEqual(@as(usize, 0), only_a_full.na);
     }
 }
@@ -2337,10 +2537,10 @@ test "Bitset CommonIterator: empty sets and zero lens" {
         try t.expectEqual(@as(usize, 0), ctx4.ni);
     }
     {
-        const It00 = Bitset(.u64).CommonIterator(0, 0, *StepIds, stepPushA, stepPushI);
+        const It00 = Bitset(.u64).CommonIterator(0, 0, *StepIds, stepPushA, stepPushI, .forward);
         var ctx = StepIds{};
         try t.expect(It00.step(.{ .includes = .{}, .excludes = .{}, .context = &ctx }, 0));
-        try t.expect(It00.iterateAll(.{ .includes = .{}, .excludes = .{}, .context = &ctx }));
+        try t.expect(It00.iterateAll(.{ .includes = .{}, .excludes = .{}, .context = &ctx }, null, null));
         try t.expectEqual(@as(usize, 0), ctx.na);
         try t.expectEqual(@as(usize, 0), ctx.ni);
     }
@@ -2490,4 +2690,132 @@ test "Bitset getBit: u8 small word" {
     try t.expectEqual(BitState.active, bs.getBit(9));
     try t.expectEqual(BitState.inactive, bs.getBit(1));
     try t.expectEqual(BitState.inactive, bs.getBit(6));
+}
+
+fn rangeCheckOne(comptime wt: WordType, n: u32, lo: ?u32, hi: ?u32) !void {
+    const BW = bit_word.BitWord(wt);
+    var bs = Bitset(wt){};
+    defer bs.deinit(t.allocator);
+    try bs.resize(t.allocator, n, .inactive);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        if (i % 3 == 0 or i % 7 == 1) bs.setBit(i, .active);
+    }
+
+    const r_lo: u32 = @min(lo orelse 0, hi orelse n);
+    const r_hi: u32 = @max(lo orelse 0, hi orelse n);
+    const c_lo: u32 = @min(r_lo, n);
+    const c_hi: u32 = @min(r_hi, n);
+
+    var exp_a: [256]u32 = undefined;
+    var exp_i: [256]u32 = undefined;
+    var n_a: usize = 0;
+    var n_i: usize = 0;
+    var k: u32 = c_lo;
+    while (k < c_hi) : (k += 1) {
+        const wid: usize = @intCast(BW.bitToWordId(k));
+        if (BW.readBitState(bs.words.items[wid], BW.bitIdInWord(k)) == .active) {
+            exp_a[n_a] = k;
+            n_a += 1;
+        } else {
+            exp_i[n_i] = k;
+            n_i += 1;
+        }
+    }
+
+    const ItF = Bitset(wt).Iterator(*StepIds, stepPushA, stepPushI, .forward);
+    const ItB = Bitset(wt).Iterator(*StepIds, stepPushA, stepPushI, .backward);
+    var fwd = StepIds{};
+    var bwd = StepIds{};
+    try t.expect(ItF.iterateAll(.{ .bitset = &bs, .context = &fwd }, lo, hi));
+    try t.expect(ItB.iterateAll(.{ .bitset = &bs, .context = &bwd }, lo, hi));
+    try t.expectEqualSlices(u32, exp_a[0..n_a], fwd.active[0..fwd.na]);
+    try t.expectEqualSlices(u32, exp_i[0..n_i], fwd.inactive[0..fwd.ni]);
+
+    var rev_a: [256]u32 = undefined;
+    var rev_i: [256]u32 = undefined;
+    for (0..n_a) |j| rev_a[j] = exp_a[n_a - 1 - j];
+    for (0..n_i) |j| rev_i[j] = exp_i[n_i - 1 - j];
+    try t.expectEqualSlices(u32, rev_a[0..n_a], bwd.active[0..bwd.na]);
+    try t.expectEqualSlices(u32, rev_i[0..n_i], bwd.inactive[0..bwd.ni]);
+
+    const ItAF = Bitset(wt).Iterator(*StepIds, stepPushA, null, .forward);
+    const ItAB = Bitset(wt).Iterator(*StepIds, stepPushA, null, .backward);
+    var fa = StepIds{};
+    var ba = StepIds{};
+    try t.expect(ItAF.iterateAll(.{ .bitset = &bs, .context = &fa }, lo, hi));
+    try t.expect(ItAB.iterateAll(.{ .bitset = &bs, .context = &ba }, lo, hi));
+    try t.expectEqualSlices(u32, exp_a[0..n_a], fa.active[0..fa.na]);
+    try t.expectEqualSlices(u32, rev_a[0..n_a], ba.active[0..ba.na]);
+}
+
+test "Bitset iterateAll: forward/backward ranges vs oracle" {
+    const bounds = [_][2]?u32{
+        .{ null, null },
+        .{ 0, 200 },
+        .{ 5, 70 },
+        .{ 70, 5 },
+        .{ 0, 1 },
+        .{ 63, 65 },
+        .{ 64, 128 },
+        .{ 129, 200 },
+        .{ 200, 200 },
+        .{ 0, 0 },
+        .{ 500, 600 },
+        .{ null, 10 },
+        .{ 120, null },
+    };
+    for (bounds) |b| {
+        try rangeCheckOne(.u64, 130, b[0], b[1]);
+        try rangeCheckOne(.u8, 130, b[0], b[1]);
+        try rangeCheckOne(.u64, 0, b[0], b[1]);
+        try rangeCheckOne(.u64, 1, b[0], b[1]);
+    }
+}
+
+test "Bitset CommonIterator: forward/backward ranges vs oracle" {
+    var inc = Bitset(.u64){};
+    defer inc.deinit(t.allocator);
+    var exc = Bitset(.u64){};
+    defer exc.deinit(t.allocator);
+    try inc.resize(t.allocator, 130, .inactive);
+    try exc.resize(t.allocator, 130, .inactive);
+    var i: u32 = 0;
+    while (i < 130) : (i += 1) {
+        if (i % 2 == 0) inc.setBit(i, .active);
+        if (i % 5 == 0) exc.setBit(i, .active);
+    }
+    const bounds = [_][2]?u32{
+        .{ null, null },
+        .{ 10, 100 },
+        .{ 100, 10 },
+        .{ 0, 64 },
+        .{ 64, 65 },
+        .{ 129, 130 },
+    };
+    for (bounds) |b| {
+        const r_lo: u32 = @min(b[0] orelse 0, b[1] orelse 130);
+        const r_hi: u32 = @max(b[0] orelse 0, b[1] orelse 130);
+        const c_lo: u32 = @min(r_lo, 130);
+        const c_hi: u32 = @min(r_hi, 130);
+        var exp: [256]u32 = undefined;
+        var n_exp: usize = 0;
+        var k: u32 = c_lo;
+        while (k < c_hi) : (k += 1) {
+            if (k % 2 == 0 and k % 5 != 0) {
+                exp[n_exp] = k;
+                n_exp += 1;
+            }
+        }
+        const ItF = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, null, .forward);
+        const ItB = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, null, .backward);
+        var fwd = StepIds{};
+        var bwd = StepIds{};
+        try t.expect(ItF.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &fwd }, b[0], b[1]));
+        try t.expect(ItB.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &bwd }, b[0], b[1]));
+        try t.expectEqualSlices(u32, exp[0..n_exp], fwd.active[0..fwd.na]);
+        var rev: [256]u32 = undefined;
+        for (0..n_exp) |j| rev[j] = exp[n_exp - 1 - j];
+        try t.expectEqualSlices(u32, rev[0..n_exp], bwd.active[0..bwd.na]);
+    }
 }

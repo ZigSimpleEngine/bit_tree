@@ -83,6 +83,43 @@ pub inline fn iterateActiveBitsInWordInline(
     return true;
 }
 
+/// Walk order shared by every iterator in bitset, layer and tree.
+/// - `forward` - visits bit ids ascending, low words and low bits first.
+/// - `backward` - visits bit ids descending, high words and high bits first.
+pub const Direction = enum {
+    /// Ascending visit order.
+    forward,
+    /// Descending visit order.
+    backward,
+};
+
+/// Resolved half-open bit interval shared by every ranged iteration.
+/// - `lo` - first visited bit id, inclusive.
+/// - `hi` - one past the last visited bit id, exclusive.
+pub const ResolvedRange = struct {
+    /// First visited bit id, inclusive.
+    lo: u32,
+    /// One past the last visited bit id, exclusive.
+    hi: u32,
+};
+
+/// Normalizes nullable range bounds into a clamped half-open interval.
+/// Argument order does not matter: the smaller value becomes the start.
+/// - `total` - valid bits in the scanned container, clamps both bounds.
+/// - `start_bit` - range edge or null for no lower limit.
+/// - `end_bit` - range edge or null for no upper limit.
+///
+/// Return - clamped `[lo, hi)` with `lo <= hi`; empty when `lo == hi`.
+pub inline fn resolveRange(total: u32, start_bit: ?u32, end_bit: ?u32) ResolvedRange {
+    const a = start_bit orelse 0;
+    const b = end_bit orelse total;
+    var lo = @min(a, b);
+    var hi = @max(a, b);
+    if (lo > total) lo = total;
+    if (hi > total) hi = total;
+    return .{ .lo = lo, .hi = hi };
+}
+
 /// Compact address of a contiguous bit span inside one pyramid level.
 pub const BitRange = struct {
     /// First bit of the span, used to seed range scans.
