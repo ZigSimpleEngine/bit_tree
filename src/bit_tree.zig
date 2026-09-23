@@ -114,6 +114,7 @@ pub fn BitTree(comptime wt: WordType) type {
         /// - `Context` - caller-provided iteration context.
         /// - `on_active` - visitor for set bits, null skips them.
         /// - `on_inactive` - visitor for cleared bits, null skips them.
+        /// - `direction` - walk order for visited bit ids.
         ///
         /// Return - iterator type with flat and tree arms.
         pub fn Iterator(
@@ -142,6 +143,8 @@ pub fn BitTree(comptime wt: WordType) type {
                 fn ActivityUnwrapper(comptime callback: InlineIteratorCallback(Context)) type {
                     return struct {
                         /// Expands one summary word into per-bit visits honoring bounds.
+                        /// The span is clipped to the cursor range and walked
+                        /// in factory `direction` order.
                         /// - `data` - tree and depth cursor.
                         /// - `word_id` - summary word index to expand.
                         ///
@@ -276,6 +279,8 @@ pub fn BitTree(comptime wt: WordType) type {
                 }
 
                 /// Walks the pyramid from the top word down to leaves.
+                /// Only top words overlapping the range are entered, leaves
+                /// outside the range are skipped, visits follow `direction`.
                 /// - `data` - tree and caller context.
                 /// - `start_bit` - range edge or null for no lower limit.
                 /// - `end_bit` - range edge or null for no upper limit.
@@ -325,6 +330,7 @@ pub fn BitTree(comptime wt: WordType) type {
                 }
 
                 /// Descends one level through a mixed summary word.
+                /// The cursor range rides along untouched for leaf clipping.
                 /// - `data` - tree and depth cursor.
                 /// - `word_id` - mixed word index to descend.
                 ///
@@ -339,6 +345,8 @@ pub fn BitTree(comptime wt: WordType) type {
                 }
 
                 /// Scans leaf words covered by a deeply mixed summary word.
+                /// The word span is clipped to the cursor range and walked
+                /// in factory `direction` order.
                 /// - `data` - tree and depth cursor.
                 /// - `word_id` - deep-mixed word index to scan.
                 ///
@@ -392,9 +400,12 @@ pub fn BitTree(comptime wt: WordType) type {
         }
 
         /// Builds a common adaptive visitor that picks flat or tree traversal.
+        /// - `include_len` - trees whose leaves are ANDed.
+        /// - `exclude_len` - trees whose leaves are ORed into the veto mask.
         /// - `Context` - caller-provided iteration context.
         /// - `on_active` - visitor for set bits, null skips them.
         /// - `on_inactive` - visitor for cleared bits, null skips them.
+        /// - `direction` - walk order for visited bit ids.
         ///
         /// Return - iterator type with flat and tree arms.
         pub fn CommonIterator(
@@ -425,6 +436,8 @@ pub fn BitTree(comptime wt: WordType) type {
                 fn ActivityUnwrapper(comptime callback: InlineIteratorCallback(Context)) type {
                     return struct {
                         /// Expands one summary word into per-bit visits honoring bounds.
+                        /// The span is clipped to the cursor range and walked
+                        /// in factory `direction` order.
                         /// - `data` - trees and depth cursor.
                         /// - `word_id` - summary word index to expand.
                         ///
@@ -529,6 +542,8 @@ pub fn BitTree(comptime wt: WordType) type {
                 }
 
                 /// Walks the pyramids from the top word down to leaves.
+                /// Only top words overlapping the range are entered, leaves
+                /// outside the range are skipped, visits follow `direction`.
                 /// - `data` - trees and caller context.
                 /// - `start_bit` - range edge or null for no lower limit.
                 /// - `end_bit` - range edge or null for no upper limit.
@@ -775,6 +790,7 @@ pub fn BitTree(comptime wt: WordType) type {
                 }
 
                 /// Descends one level through a mixed summary word.
+                /// The cursor range rides along untouched for leaf clipping.
                 /// - `data` - trees and depth cursor.
                 /// - `word_id` - mixed word index to descend.
                 ///
@@ -797,6 +813,13 @@ pub fn BitTree(comptime wt: WordType) type {
                 }
 
                 /// Scans leaf words covered by a deeply mixed summary word.
+                /// - `data` - trees and depth cursor.
+                /// - `word_id` - deep-mixed word index to scan.
+                ///
+                /// Return - false on early exit, true when the scan completed.
+                /// Scans leaf words covered by a deeply mixed summary word.
+                /// The word span is clipped to the cursor range and walked
+                /// in factory `direction` order.
                 /// - `data` - trees and depth cursor.
                 /// - `word_id` - deep-mixed word index to scan.
                 ///

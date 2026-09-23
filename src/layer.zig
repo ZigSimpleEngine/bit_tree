@@ -143,6 +143,14 @@ pub fn Layer(comptime wt: WordType) type {
         }
 
         /// Builds a word-wise visitor that dispatches by four-state summary.
+        /// - `Context` - caller-provided iteration context.
+        /// - `on_inactive` - visitor for inactive lanes, null skips them.
+        /// - `on_active` - visitor for active lanes, null skips them.
+        /// - `on_mixed` - visitor for mixed lanes, null skips them.
+        /// - `on_deep_mixed` - visitor for deeply mixed lanes, null skips them.
+        /// - `direction` - walk order for words and for lanes inside one word.
+        ///
+        /// Return - iterator type with ranged and single-word entry points.
         pub fn Iterator(
             comptime Context: type,
             comptime on_inactive: InlineIteratorCallback(Context),
@@ -153,6 +161,7 @@ pub fn Layer(comptime wt: WordType) type {
         ) type {
             return struct {
                 /// Visits one word and routes each valid bit to its state callback.
+                /// Lanes are visited in factory `direction` order.
                 /// - `data` - level and caller context.
                 /// - `word_id` - word index to scan.
                 ///
@@ -335,6 +344,7 @@ pub fn Layer(comptime wt: WordType) type {
                 }
 
                 /// Fast path when all four callbacks exist, scans linearly by bound.
+                /// Lanes are visited in factory `direction` order.
                 /// - `data` - level and caller context.
                 /// - `word_id` - word index to scan.
                 ///
@@ -369,6 +379,7 @@ pub fn Layer(comptime wt: WordType) type {
                 }
 
                 /// Selective path that peels only states with installed callbacks.
+                /// Lanes are visited in factory `direction` order.
                 /// - `data` - level and caller context.
                 /// - `word_id` - word index to scan.
                 ///
@@ -423,6 +434,16 @@ pub fn Layer(comptime wt: WordType) type {
         }
 
         /// Builds a word-wise visitor that dispatches by common states.
+        /// - `include_len` - levels whose states are ANDed.
+        /// - `exclude_len` - levels whose states are ORed into the veto mask.
+        /// - `Context` - caller-provided iteration context.
+        /// - `on_inactive` - visitor for common inactive lanes, null skips them.
+        /// - `on_active` - visitor for common active lanes, null skips them.
+        /// - `on_mixed` - visitor for common mixed lanes, null skips them.
+        /// - `on_deep_mixed` - visitor for common deeply mixed lanes, null skips them.
+        /// - `direction` - walk order for words and for lanes inside one word.
+        ///
+        /// Return - iterator type with ranged and single-word entry points.
         pub fn CommonIterator(
             comptime include_len: u32,
             comptime exclude_len: u32,
@@ -435,6 +456,7 @@ pub fn Layer(comptime wt: WordType) type {
         ) type {
             return struct {
                 /// Visits one word and routes each valid bit to its state callback.
+                /// Lanes are visited in factory `direction` order.
                 /// - `data` - levels and caller context.
                 /// - `word_id` - word index to scan.
                 ///
@@ -613,6 +635,7 @@ pub fn Layer(comptime wt: WordType) type {
                 }
 
                 /// Fast path when all four callbacks exist, scans linearly by bound.
+                /// Lanes are visited in factory `direction` order.
                 /// - `data` - levels and caller context.
                 /// - `word_id` - word index to scan.
                 ///
@@ -648,6 +671,7 @@ pub fn Layer(comptime wt: WordType) type {
                 }
 
                 /// Selective path that peels only states with installed callbacks.
+                /// Lanes are visited in factory `direction` order.
                 /// - `data` - levels and caller context.
                 /// - `word_id` - word index to scan.
                 ///

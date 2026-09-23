@@ -57,6 +57,12 @@ pub fn Bitset(comptime wt: WordType) type {
         }
 
         /// Builds a word-wise visitor that dispatches by bit value.
+        /// - `Context` - caller-provided iteration context.
+        /// - `on_active` - visitor for set bits, null skips them.
+        /// - `on_inactive` - visitor for cleared bits, null skips them.
+        /// - `direction` - walk order for words and for bits inside one word.
+        ///
+        /// Return - iterator type with ranged and single-word entry points.
         pub fn Iterator(
             comptime Context: type,
             comptime on_active: InlineIteratorCallback(Context),
@@ -65,6 +71,7 @@ pub fn Bitset(comptime wt: WordType) type {
         ) type {
             return struct {
                 /// Visits one word and routes each valid bit to its callback.
+                /// Lanes are visited in factory `direction` order.
                 /// - `data` - bitset and caller context.
                 /// - `word_id` - word index to scan.
                 ///
@@ -154,6 +161,7 @@ pub fn Bitset(comptime wt: WordType) type {
                 }
 
                 /// Fast path when both callbacks exist, merges by bound linearly.
+                /// Lanes are visited in factory `direction` order.
                 /// - `data` - bitset and caller context.
                 /// - `word_id` - word index to scan.
                 ///
@@ -174,6 +182,7 @@ pub fn Bitset(comptime wt: WordType) type {
                 }
 
                 /// Selective path that peels only sides with installed callbacks.
+                /// Lanes are visited in factory `direction` order.
                 /// - `data` - bitset and caller context.
                 /// - `word_id` - word index to scan.
                 ///
@@ -270,7 +279,7 @@ pub fn Bitset(comptime wt: WordType) type {
                     return true;
                 }
 
-                /// Peels one masked word into a single callback in bit order.
+                /// Peels one masked word into a single callback in ascending bit order.
                 /// - `context` - caller context for the callback.
                 /// - `base` - global id of the word start.
                 /// - `word` - pre-masked word to peel.
@@ -377,6 +386,14 @@ pub fn Bitset(comptime wt: WordType) type {
         }
 
         /// Builds a word-wise visitor that dispatches by common masks.
+        /// - `include_len` - bitsets whose words are ANDed.
+        /// - `exclude_len` - bitsets whose words are ORed into the veto mask.
+        /// - `Context` - caller-provided iteration context.
+        /// - `on_active` - visitor for common set bits, null skips them.
+        /// - `on_inactive` - visitor for common cleared bits, null skips them.
+        /// - `direction` - walk order for words and for bits inside one word.
+        ///
+        /// Return - iterator type with ranged and single-word entry points.
         pub fn CommonIterator(
             comptime include_len: u32,
             comptime exclude_len: u32,
@@ -387,6 +404,7 @@ pub fn Bitset(comptime wt: WordType) type {
         ) type {
             return struct {
                 /// Visits one word and routes each valid bit to its callback.
+                /// Lanes are visited in factory `direction` order.
                 /// - `data` - bitsets and caller context.
                 /// - `word_id` - word index to scan.
                 ///
@@ -420,7 +438,7 @@ pub fn Bitset(comptime wt: WordType) type {
                             var wid: usize = if (direction == .forward) lo_word else hi_word;
                             while (true) {
                                 const word_id: u32 = @truncate(wid);
-                                const w = commonActiveWord(data, word_id) & wordRangeMask(first, wid, range.lo, range.hi);
+                                const w = commonActiveWord(data, word_id) & wordRangeMask(wid, range.lo, range.hi);
                                 const base = bw.wordToBitId(word_id);
                                 const ok = if (direction == .forward)
                                     flatPeelWord(context, base, w, f)
@@ -439,7 +457,7 @@ pub fn Bitset(comptime wt: WordType) type {
                             var wid: usize = if (direction == .forward) lo_word else hi_word;
                             while (true) {
                                 const word_id: u32 = @truncate(wid);
-                                const w = commonInactiveWord(data, word_id) & wordRangeMask(first, wid, range.lo, range.hi);
+                                const w = commonInactiveWord(data, word_id) & wordRangeMask(wid, range.lo, range.hi);
                                 const base = bw.wordToBitId(word_id);
                                 const ok = if (direction == .forward)
                                     flatPeelWord(context, base, w, f)
@@ -467,14 +485,12 @@ pub fn Bitset(comptime wt: WordType) type {
                 }
 
                 /// Keeps only range-covered lanes of one word, padding excluded.
-                /// - `first` - bounds source for the range, any merged bitset.
                 /// - `word_id` - word index to mask.
                 /// - `lo` - resolved range start, inclusive.
                 /// - `hi` - resolved range end, exclusive.
                 ///
                 /// Return - mask with exactly the visited lanes set.
-                inline fn wordRangeMask(first: *Self, word_id: usize, lo: u32, hi: u32) Word {
-                    _ = first;
+                inline fn wordRangeMask(word_id: usize, lo: u32, hi: u32) Word {
                     const w_base = bw.wordToBitId(@truncate(word_id));
                     const s = @max(lo, w_base) - w_base;
                     const e = @min(hi, w_base + bw.word_type_bits) - w_base;
@@ -482,6 +498,7 @@ pub fn Bitset(comptime wt: WordType) type {
                 }
 
                 /// Fast path when both callbacks exist, merges by bound linearly.
+                /// Lanes are visited in factory `direction` order.
                 /// - `data` - bitsets and caller context.
                 /// - `word_id` - word index to scan.
                 ///
@@ -502,6 +519,7 @@ pub fn Bitset(comptime wt: WordType) type {
                 }
 
                 /// Selective path that peels only sides with installed callbacks.
+                /// Lanes are visited in factory `direction` order.
                 /// - `data` - bitsets and caller context.
                 /// - `word_id` - word index to scan.
                 ///
@@ -630,7 +648,7 @@ pub fn Bitset(comptime wt: WordType) type {
                     return include_inv_mask & ~exclude_inv_mask;
                 }
 
-                /// Peels one masked word into a single callback in bit order.
+                /// Peels one masked word into a single callback in ascending bit order.
                 /// - `context` - caller context for the callback.
                 /// - `base` - global id of the word start.
                 /// - `word` - pre-masked word to peel.
