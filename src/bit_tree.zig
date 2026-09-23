@@ -1,7 +1,7 @@
 const std = @import("std");
 const utilities = @import("utilities.zig");
 const bit_word = @import("bit_word.zig");
-const BitSet = @import("bit_set.zig").BitSet;
+const Bitset = @import("bitset.zig").Bitset;
 const Layer = @import("layer.zig").Layer;
 
 const InlineIteratorCallback = utilities.InlineIteratorCallback;
@@ -78,7 +78,7 @@ pub fn BitTree(comptime wt: WordType) type {
         const Self = @This();
 
         /// Flat leaf storage holding every valid bit.
-        bitset: BitSet(wt) = .{},
+        bitset: Bitset(wt) = .{},
         /// Summary pyramid where level zero mirrors the bitset.
         layers: ListA64(L) = .empty,
 
@@ -720,7 +720,7 @@ pub fn BitTree(comptime wt: WordType) type {
         /// Level type alias that shortens pyramid declarations.
         const L = Layer(wt);
         /// Leaf type alias that shortens flat-path declarations.
-        const B = BitSet(wt);
+        const B = Bitset(wt);
 
         /// Releases leaves and every pyramid level.
         /// - `self` - tree to destroy.
@@ -1646,7 +1646,7 @@ test "BitTree CommonIterator cross: summary layer vs bitset 262144" {
     defer bctx.inactive.deinit(bctx.alloc);
     try bctx.active.ensureTotalCapacity(bctx.alloc, N);
     try bctx.inactive.ensureTotalCapacity(bctx.alloc, N);
-    const BI = BitSet(.u64).CommonIterator(2, 2, *CrossIds, crossPushA, crossPushI);
+    const BI = Bitset(.u64).CommonIterator(2, 2, *CrossIds, crossPushA, crossPushI);
     try t.expect(BI.iterateAll(.{
         .includes = .{ &trees[0].bitset, &trees[1].bitset },
         .excludes = .{ &trees[2].bitset, &trees[3].bitset },

@@ -14,7 +14,7 @@ const WordType = bit_word.WordType;
 /// - `wt` - word width for backing storage.
 ///
 /// Return - bitset type with word-wise iteration.
-pub fn BitSet(comptime wt: WordType) type {
+pub fn Bitset(comptime wt: WordType) type {
     const Word = wt.Type();
     const bw = bit_word.BitWord(wt);
 
@@ -673,7 +673,7 @@ pub fn BitSet(comptime wt: WordType) type {
 
 const t = std.testing;
 
-fn bitSetScanActiveCount(comptime wt: WordType, bs: *const BitSet(wt)) u32 {
+fn bitsetScanActiveCount(comptime wt: WordType, bs: *const Bitset(wt)) u32 {
     const BW = bit_word.BitWord(wt);
     var acc: u32 = 0;
     var i: u32 = 0;
@@ -685,7 +685,7 @@ fn bitSetScanActiveCount(comptime wt: WordType, bs: *const BitSet(wt)) u32 {
     return acc;
 }
 
-fn expectBitSetInvariants(comptime wt: WordType, bs: *const BitSet(wt)) !void {
+fn expectBitsetInvariants(comptime wt: WordType, bs: *const Bitset(wt)) !void {
     const Word = wt.Type();
     const BW = bit_word.BitWord(wt);
     const want_words: usize = @intCast(BW.bitsToWordsCount(bs.bits_count));
@@ -700,7 +700,7 @@ fn expectBitSetInvariants(comptime wt: WordType, bs: *const BitSet(wt)) !void {
         const last = bs.words.items[want_words - 1];
         try t.expectEqual(@as(Word, 0), last & ~valid);
     }
-    const scanned = bitSetScanActiveCount(wt, bs);
+    const scanned = bitsetScanActiveCount(wt, bs);
     try t.expectEqual(scanned, bs.active_bits_counter);
     try t.expect(bs.active_bits_counter <= bs.bits_count);
 }
@@ -718,9 +718,9 @@ fn patternBit(p: ResizePattern, i: u32) BitState {
     };
 }
 
-fn initBitSetPattern(comptime wt: WordType, allocator: Allocator, bits: u32, pat: ResizePattern) !BitSet(wt) {
+fn initBitsetPattern(comptime wt: WordType, allocator: Allocator, bits: u32, pat: ResizePattern) !Bitset(wt) {
     const Word = wt.Type();
-    var bs = BitSet(wt){};
+    var bs = Bitset(wt){};
     try bs.resize(allocator, bits, .inactive);
     const BW = bit_word.BitWord(wt);
     var want_active: u32 = 0;
@@ -734,12 +734,12 @@ fn initBitSetPattern(comptime wt: WordType, allocator: Allocator, bits: u32, pat
         }
     }
     bs.active_bits_counter = want_active;
-    try expectBitSetInvariants(wt, &bs);
+    try expectBitsetInvariants(wt, &bs);
     return bs;
 }
 
 fn checkOneResize(comptime wt: WordType, allocator: Allocator, old: u32, new: u32, created: BitState, pat: ResizePattern) !void {
-    var bs = try initBitSetPattern(wt, allocator, old, pat);
+    var bs = try initBitsetPattern(wt, allocator, old, pat);
     defer bs.deinit(allocator);
 
     var expected_active: u32 = 0;
@@ -771,7 +771,7 @@ fn checkOneResize(comptime wt: WordType, allocator: Allocator, old: u32, new: u3
         const got = BW.readBitState(bs.words.items[wid], bid);
         try t.expectEqual(want, got);
     }
-    try expectBitSetInvariants(wt, &bs);
+    try expectBitsetInvariants(wt, &bs);
 }
 
 fn nextRandU32(state: *u64) u32 {
@@ -783,8 +783,8 @@ fn nextRandU32(state: *u64) u32 {
     return @truncate((x *% 0x2545F4914F6CDD1D) >> 32);
 }
 
-test "BitSet resize" {
-    var bs = BitSet(.u64){};
+test "Bitset resize" {
+    var bs = Bitset(.u64){};
     defer bs.deinit(t.allocator);
 
     try bs.resize(t.allocator, 100, BitState.active);
@@ -833,8 +833,8 @@ test "BitSet resize" {
     try t.expectEqual(47, bs.words.items.len);
 }
 
-test "BitSet resize minimal: grow active unaligned must keep padding zero" {
-    var bs = BitSet(.u64){};
+test "Bitset resize minimal: grow active unaligned must keep padding zero" {
+    var bs = Bitset(.u64){};
     defer bs.deinit(t.allocator);
     try bs.resize(t.allocator, 10, .active);
     try t.expectEqual(@as(u32, 10), bs.bits_count);
@@ -842,19 +842,19 @@ test "BitSet resize minimal: grow active unaligned must keep padding zero" {
     try t.expectEqual(@as(usize, 1), bs.words.items.len);
     const BW = bit_word.BitWord(.u64);
     try t.expectEqual(@as(u64, 0), bs.words.items[0] & ~BW.maskStart(10));
-    try expectBitSetInvariants(.u64, &bs);
+    try expectBitsetInvariants(.u64, &bs);
 
-    var bs2 = BitSet(.u64){};
+    var bs2 = Bitset(.u64){};
     defer bs2.deinit(t.allocator);
     try bs2.resize(t.allocator, 65, .active);
     try t.expectEqual(@as(u32, 65), bs2.active_bits_counter);
     try t.expectEqual(@as(u64, 0), bs2.words.items[1] & ~BW.maskStart(1));
-    try expectBitSetInvariants(.u64, &bs2);
+    try expectBitsetInvariants(.u64, &bs2);
 }
 
-test "BitSet resize minimal: shrink to aligned must fix counter" {
+test "Bitset resize minimal: shrink to aligned must fix counter" {
     {
-        var bs = BitSet(.u64){};
+        var bs = Bitset(.u64){};
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 128, .active);
         try t.expectEqual(@as(u32, 128), bs.active_bits_counter);
@@ -862,10 +862,10 @@ test "BitSet resize minimal: shrink to aligned must fix counter" {
         try t.expectEqual(@as(u32, 64), bs.bits_count);
         try t.expectEqual(@as(usize, 1), bs.words.items.len);
         try t.expectEqual(@as(u32, 64), bs.active_bits_counter);
-        try expectBitSetInvariants(.u64, &bs);
+        try expectBitsetInvariants(.u64, &bs);
     }
     {
-        var bs = BitSet(.u64){};
+        var bs = Bitset(.u64){};
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 64, .active);
         try bs.resize(t.allocator, 0, .inactive);
@@ -874,30 +874,30 @@ test "BitSet resize minimal: shrink to aligned must fix counter" {
         try t.expectEqual(@as(u32, 0), bs.active_bits_counter);
     }
     {
-        var bs = try initBitSetPattern(.u64, t.allocator, 65, .one);
+        var bs = try initBitsetPattern(.u64, t.allocator, 65, .one);
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 64, .inactive);
         try t.expectEqual(@as(u32, 64), bs.active_bits_counter);
-        try expectBitSetInvariants(.u64, &bs);
+        try expectBitsetInvariants(.u64, &bs);
     }
     {
-        var bs = try initBitSetPattern(.u8, t.allocator, 9, .one);
+        var bs = try initBitsetPattern(.u8, t.allocator, 9, .one);
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 8, .inactive);
         try t.expectEqual(@as(u32, 8), bs.active_bits_counter);
-        try expectBitSetInvariants(.u8, &bs);
+        try expectBitsetInvariants(.u8, &bs);
     }
 }
 
-test "BitSet resize minimal: shrink same-word must clear tail" {
-    var bs = try initBitSetPattern(.u64, t.allocator, 20, .one);
+test "Bitset resize minimal: shrink same-word must clear tail" {
+    var bs = try initBitsetPattern(.u64, t.allocator, 20, .one);
     defer bs.deinit(t.allocator);
     try bs.resize(t.allocator, 10, .inactive);
     try t.expectEqual(@as(u32, 10), bs.active_bits_counter);
-    try expectBitSetInvariants(.u64, &bs);
+    try expectBitsetInvariants(.u64, &bs);
 }
 
-test "BitSet(u8) resize exhaustive 0..20 oracle" {
+test "Bitset(u8) resize exhaustive 0..20 oracle" {
     const patterns = [_]ResizePattern{ .zero, .one, .alt01, .alt10, .every3, .pseudo };
     const createds = [_]BitState{ .inactive, .active };
     for (0..21) |old_usize| {
@@ -911,7 +911,7 @@ test "BitSet(u8) resize exhaustive 0..20 oracle" {
     }
 }
 
-test "BitSet(u64) resize boundary oracle" {
+test "Bitset(u64) resize boundary oracle" {
     const bounds = [_]u32{ 0, 1, 2, 63, 64, 65, 70, 100, 126, 127, 128, 129, 130, 191, 192, 193, 200 };
     const patterns = [_]ResizePattern{ .zero, .one, .alt01, .alt10, .every3, .pseudo };
     const createds = [_]BitState{ .inactive, .active };
@@ -926,7 +926,7 @@ test "BitSet(u64) resize boundary oracle" {
     }
 }
 
-test "BitSet(u32) resize boundary oracle" {
+test "Bitset(u32) resize boundary oracle" {
     const bounds = [_]u32{ 0, 1, 2, 31, 32, 33, 40, 63, 64, 65, 95, 96, 97, 100 };
     const patterns = [_]ResizePattern{ .zero, .one, .alt01, .alt10, .every3, .pseudo };
     const createds = [_]BitState{ .inactive, .active };
@@ -941,7 +941,7 @@ test "BitSet(u32) resize boundary oracle" {
     }
 }
 
-test "BitSet(u16) resize boundary oracle" {
+test "Bitset(u16) resize boundary oracle" {
     const bounds = [_]u32{ 0, 1, 2, 15, 16, 17, 24, 31, 32, 33, 47, 48, 49 };
     const patterns = [_]ResizePattern{ .zero, .one, .alt01, .alt10, .every3, .pseudo };
     const createds = [_]BitState{ .inactive, .active };
@@ -956,7 +956,7 @@ test "BitSet(u16) resize boundary oracle" {
     }
 }
 
-test "BitSet resize explicit corner table u64" {
+test "Bitset resize explicit corner table u64" {
     const Case = struct { old: u32, new: u32, created: BitState, pat: ResizePattern };
     const cases = [_]Case{
         .{ .old = 0, .new = 0, .created = .active, .pat = .zero },
@@ -1002,8 +1002,8 @@ test "BitSet resize explicit corner table u64" {
     }
 }
 
-test "BitSet(u64) resize sequential fuzz vs oracle" {
-    var bs = BitSet(.u64){};
+test "Bitset(u64) resize sequential fuzz vs oracle" {
+    var bs = Bitset(.u64){};
     defer bs.deinit(t.allocator);
     var expected: [512]u1 = [_]u1{0} ** 512;
     var expected_len: u32 = 0;
@@ -1039,12 +1039,12 @@ test "BitSet(u64) resize sequential fuzz vs oracle" {
             const got = BW.readBitState(bs.words.items[wid], BW.bitIdInWord(i));
             try t.expectEqual(want, got);
         }
-        try expectBitSetInvariants(.u64, &bs);
+        try expectBitsetInvariants(.u64, &bs);
     }
 }
 
-test "BitSet(u8) resize sequential fuzz vs oracle" {
-    var bs = BitSet(.u8){};
+test "Bitset(u8) resize sequential fuzz vs oracle" {
+    var bs = Bitset(.u8){};
     defer bs.deinit(t.allocator);
     var expected: [64]u1 = [_]u1{0} ** 64;
     var expected_len: u32 = 0;
@@ -1080,14 +1080,14 @@ test "BitSet(u8) resize sequential fuzz vs oracle" {
             const got = BW.readBitState(bs.words.items[wid], BW.bitIdInWord(i));
             try t.expectEqual(want, got);
         }
-        try expectBitSetInvariants(.u8, &bs);
+        try expectBitsetInvariants(.u8, &bs);
     }
 }
 
-test "BitSet resize same-size no-op keeps storage" {
+test "Bitset resize same-size no-op keeps storage" {
     const sizes = [_]u32{ 0, 1, 7, 8, 9, 64, 65, 128 };
     for (sizes) |n| {
-        var bs = try initBitSetPattern(.u64, t.allocator, n, .pseudo);
+        var bs = try initBitsetPattern(.u64, t.allocator, n, .pseudo);
         defer bs.deinit(t.allocator);
         const old_counter = bs.active_bits_counter;
         const old_len = bs.words.items.len;
@@ -1097,11 +1097,11 @@ test "BitSet resize same-size no-op keeps storage" {
         try t.expectEqual(old_len, bs.words.items.len);
         try bs.resize(t.allocator, n, .inactive);
         try t.expectEqual(old_counter, bs.active_bits_counter);
-        try expectBitSetInvariants(.u64, &bs);
+        try expectBitsetInvariants(.u64, &bs);
     }
 }
 
-test "BitSet resize large sizes oracle" {
+test "Bitset resize large sizes oracle" {
     try checkOneResize(.u64, t.allocator, 0, 10000, .active, .zero);
     try checkOneResize(.u64, t.allocator, 0, 10000, .inactive, .zero);
     try checkOneResize(.u64, t.allocator, 10000, 2000, .inactive, .one);
@@ -1110,8 +1110,8 @@ test "BitSet resize large sizes oracle" {
     try checkOneResize(.u64, t.allocator, 64, 10000, .active, .alt01);
 }
 
-test "BitSet(u64) setWord: masked insert + counters" {
-    const B64 = BitSet(.u64);
+test "Bitset(u64) setWord: masked insert + counters" {
+    const B64 = Bitset(.u64);
     var bs: B64 = .{};
     defer bs.deinit(t.allocator);
     try bs.resize(t.allocator, 128, .inactive);
@@ -1121,37 +1121,37 @@ test "BitSet(u64) setWord: masked insert + counters" {
     for (0..32) |i| low |= @as(u64, 1) << @intCast(i);
     bs.setWord(0, low, std.math.maxInt(u64));
     try t.expectEqual(@as(u32, 32), bs.active_bits_counter);
-    try expectBitSetInvariants(.u64, &bs);
+    try expectBitsetInvariants(.u64, &bs);
 
     bs.setWord(0, std.math.maxInt(u64), @as(u64, 0xFFFFFFFF) << 32);
     try t.expectEqual(@as(u32, 64), bs.active_bits_counter);
-    try expectBitSetInvariants(.u64, &bs);
+    try expectBitsetInvariants(.u64, &bs);
 
     bs.setWord(0, 0, 0);
     try t.expectEqual(@as(u32, 64), bs.active_bits_counter);
 
     bs.setWord(0, bs.words.items[0], std.math.maxInt(u64));
     try t.expectEqual(@as(u32, 64), bs.active_bits_counter);
-    try expectBitSetInvariants(.u64, &bs);
+    try expectBitsetInvariants(.u64, &bs);
 
     bs.setWord(1, std.math.maxInt(u64), 0x1);
     try t.expectEqual(@as(u32, 65), bs.active_bits_counter);
-    try expectBitSetInvariants(.u64, &bs);
+    try expectBitsetInvariants(.u64, &bs);
 }
 
-test "BitSet(u64) setWord: padding bits ignored" {
-    const B64 = BitSet(.u64);
+test "Bitset(u64) setWord: padding bits ignored" {
+    const B64 = Bitset(.u64);
     var bs: B64 = .{};
     defer bs.deinit(t.allocator);
     try bs.resize(t.allocator, 70, .inactive);
     bs.setWord(1, std.math.maxInt(u64), std.math.maxInt(u64));
     try t.expectEqual(@as(u32, 6), bs.active_bits_counter);
-    try expectBitSetInvariants(.u64, &bs);
+    try expectBitsetInvariants(.u64, &bs);
     try t.expectEqual(@as(u64, 0x3F), bs.words.items[1]);
 }
 
-test "BitSet(u64) setBit: flip + counters" {
-    const B64 = BitSet(.u64);
+test "Bitset(u64) setBit: flip + counters" {
+    const B64 = Bitset(.u64);
     var bs: B64 = .{};
     defer bs.deinit(t.allocator);
     try bs.resize(t.allocator, 130, .inactive);
@@ -1162,20 +1162,20 @@ test "BitSet(u64) setBit: flip + counters" {
     bs.setBit(64, .active);
     bs.setBit(129, .active);
     try t.expectEqual(@as(u32, 4), bs.active_bits_counter);
-    try expectBitSetInvariants(.u64, &bs);
+    try expectBitsetInvariants(.u64, &bs);
 
     bs.setBit(0, .active);
     try t.expectEqual(@as(u32, 4), bs.active_bits_counter);
 
     bs.setBit(63, .inactive);
     try t.expectEqual(@as(u32, 3), bs.active_bits_counter);
-    try expectBitSetInvariants(.u64, &bs);
+    try expectBitsetInvariants(.u64, &bs);
 
     bs.setBit(129, .inactive);
     bs.setBit(64, .inactive);
     bs.setBit(0, .inactive);
     try t.expectEqual(@as(u32, 0), bs.active_bits_counter);
-    try expectBitSetInvariants(.u64, &bs);
+    try expectBitsetInvariants(.u64, &bs);
 }
 
 const StepIds = struct {
@@ -1198,8 +1198,8 @@ inline fn stepPushI(ctx: *StepIds, bit_id: u32) bool {
     return ctx.na + ctx.ni < ctx.stop_after;
 }
 
-fn stepCollectAll(comptime wt: WordType, bs: *BitSet(wt), ctx: *StepIds) bool {
-    const It = BitSet(wt).Iterator(*StepIds, stepPushA, stepPushI);
+fn stepCollectAll(comptime wt: WordType, bs: *Bitset(wt), ctx: *StepIds) bool {
+    const It = Bitset(wt).Iterator(*StepIds, stepPushA, stepPushI);
     var wid: u32 = 0;
     while (wid < bs.words.items.len) : (wid += 1) {
         if (!It.step(.{ .bitset = bs, .context = ctx }, wid)) return false;
@@ -1207,7 +1207,7 @@ fn stepCollectAll(comptime wt: WordType, bs: *BitSet(wt), ctx: *StepIds) bool {
     return true;
 }
 
-fn stepOracleIds(comptime wt: WordType, bs: *const BitSet(wt), target: BitState, out: *[256]u32) usize {
+fn stepOracleIds(comptime wt: WordType, bs: *const Bitset(wt), target: BitState, out: *[256]u32) usize {
     const BW = bit_word.BitWord(wt);
     var n: usize = 0;
     var i: u32 = 0;
@@ -1224,7 +1224,7 @@ fn stepOracleIds(comptime wt: WordType, bs: *const BitSet(wt), target: BitState,
 fn stepCheckOne(comptime wt: WordType, n: u32, pat: ResizePattern) !void {
     const Word = wt.Type();
     const BW = bit_word.BitWord(wt);
-    var bs = BitSet(wt){};
+    var bs = Bitset(wt){};
     defer bs.deinit(t.allocator);
     try bs.resize(t.allocator, n, .inactive);
     var i: u32 = 0;
@@ -1252,7 +1252,7 @@ fn stepCheckOne(comptime wt: WordType, n: u32, pat: ResizePattern) !void {
     try t.expectEqual(n, @as(u32, @intCast(ctx.na + ctx.ni)));
 }
 
-test "BitSet step: active/inactive counts + corners" {
+test "Bitset step: active/inactive counts + corners" {
     const sizes = [_]u32{ 0, 1, 2, 7, 8, 9, 15, 16, 17, 63, 64, 65, 70, 127, 128, 129, 200 };
     const patterns = [_]ResizePattern{ .zero, .one, .alt01, .alt10, .every3, .pseudo };
     for (sizes) |n| {
@@ -1263,14 +1263,14 @@ test "BitSet step: active/inactive counts + corners" {
     }
 }
 
-test "BitSet step: null side is skipped" {
+test "Bitset step: null side is skipped" {
     {
-        var bs = BitSet(.u64){};
+        var bs = Bitset(.u64){};
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 70, .inactive);
         bs.setBit(5, .active);
         bs.setBit(69, .active);
-        const It = BitSet(.u64).Iterator(*StepIds, stepPushA, null);
+        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, null);
         var ctx = StepIds{};
         try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 0));
         try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 1));
@@ -1279,11 +1279,11 @@ test "BitSet step: null side is skipped" {
     }
 
     {
-        var bs = BitSet(.u8){};
+        var bs = Bitset(.u8){};
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 10, .active);
         bs.setBit(3, .inactive);
-        const It = BitSet(.u8).Iterator(*StepIds, null, stepPushI);
+        const It = Bitset(.u8).Iterator(*StepIds, null, stepPushI);
         var ctx = StepIds{};
         try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 0));
         try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 1));
@@ -1292,12 +1292,12 @@ test "BitSet step: null side is skipped" {
     }
 }
 
-test "BitSet step: early exit stops the walk" {
+test "Bitset step: early exit stops the walk" {
     {
-        var bs = BitSet(.u64){};
+        var bs = Bitset(.u64){};
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 70, .active);
-        const It = BitSet(.u64).Iterator(*StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, stepPushI);
         var ctx = StepIds{ .stop_after = 3 };
         try t.expect(!It.step(.{ .bitset = &bs, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 3), ctx.na);
@@ -1306,12 +1306,12 @@ test "BitSet step: early exit stops the walk" {
     }
 
     {
-        var bs = BitSet(.u64){};
+        var bs = Bitset(.u64){};
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 10, .inactive);
         bs.setBit(0, .active);
         bs.setBit(9, .active);
-        const It = BitSet(.u64).Iterator(*StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, stepPushI);
         var ctx = StepIds{ .stop_after = 4 };
 
         try t.expect(!It.step(.{ .bitset = &bs, .context = &ctx }, 0));
@@ -1320,10 +1320,10 @@ test "BitSet step: early exit stops the walk" {
     }
 
     {
-        var bs = BitSet(.u64){};
+        var bs = Bitset(.u64){};
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 130, .active);
-        const It = BitSet(.u64).Iterator(*StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, stepPushI);
         var ctx = StepIds{ .stop_after = 70 };
         try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 64), ctx.na);
@@ -1334,27 +1334,27 @@ test "BitSet step: early exit stops the walk" {
     }
 
     {
-        var bs = BitSet(.u64){};
+        var bs = Bitset(.u64){};
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 10, .active);
-        const It = BitSet(.u64).Iterator(*StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).Iterator(*StepIds, stepPushA, stepPushI);
         var ctx = StepIds{ .stop_after = 1 };
         try t.expect(!It.step(.{ .bitset = &bs, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 1), ctx.na);
     }
 }
 
-fn iterateAllCollect(comptime wt: WordType, bs: *BitSet(wt), ctx: *StepIds) bool {
-    const It = BitSet(wt).Iterator(*StepIds, stepPushA, stepPushI);
+fn iterateAllCollect(comptime wt: WordType, bs: *Bitset(wt), ctx: *StepIds) bool {
+    const It = Bitset(wt).Iterator(*StepIds, stepPushA, stepPushI);
     return It.iterateAll(.{ .bitset = bs, .context = ctx });
 }
 
-test "BitSet iterateAll: parity with per-word step + oracle" {
+test "Bitset iterateAll: parity with per-word step + oracle" {
     const sizes = [_]u32{ 0, 1, 2, 7, 8, 9, 63, 64, 65, 70, 128, 129, 200 };
     const patterns = [_]ResizePattern{ .zero, .one, .alt01, .alt10, .every3, .pseudo };
     for (sizes) |n| {
         for (patterns) |pat| {
-            var bs = try initBitSetPattern(.u64, t.allocator, n, pat);
+            var bs = try initBitsetPattern(.u64, t.allocator, n, pat);
             defer bs.deinit(t.allocator);
             var a = StepIds{};
             var b = StepIds{};
@@ -1371,7 +1371,7 @@ test "BitSet iterateAll: parity with per-word step + oracle" {
         }
     }
     {
-        var bs = BitSet(.u64){};
+        var bs = Bitset(.u64){};
         defer bs.deinit(t.allocator);
         try bs.resize(t.allocator, 10, .inactive);
         bs.setBit(0, .active);
@@ -1414,11 +1414,11 @@ fn commonStepCollect(
     comptime EL: u32,
     comptime on_a: InlineIteratorCallback(*StepIds),
     comptime on_i: InlineIteratorCallback(*StepIds),
-    includes: [IL]*BitSet(wt),
-    excludes: [EL]*BitSet(wt),
+    includes: [IL]*Bitset(wt),
+    excludes: [EL]*Bitset(wt),
     ctx: *StepIds,
 ) bool {
-    const It = BitSet(wt).CommonIterator(IL, EL, *StepIds, on_a, on_i);
+    const It = Bitset(wt).CommonIterator(IL, EL, *StepIds, on_a, on_i);
     if (IL == 0 and EL == 0) return true;
     const words_len = if (IL > 0) includes[0].words.items.len else excludes[0].words.items.len;
     var wid: u32 = 0;
@@ -1434,11 +1434,11 @@ fn commonIterateAllCollect(
     comptime EL: u32,
     comptime on_a: InlineIteratorCallback(*StepIds),
     comptime on_i: InlineIteratorCallback(*StepIds),
-    includes: [IL]*BitSet(wt),
-    excludes: [EL]*BitSet(wt),
+    includes: [IL]*Bitset(wt),
+    excludes: [EL]*Bitset(wt),
     ctx: *StepIds,
 ) bool {
-    const It = BitSet(wt).CommonIterator(IL, EL, *StepIds, on_a, on_i);
+    const It = Bitset(wt).CommonIterator(IL, EL, *StepIds, on_a, on_i);
     return It.iterateAll(.{ .includes = includes, .excludes = excludes, .context = ctx });
 }
 
@@ -1446,11 +1446,11 @@ fn commonStepCollectOrder(
     comptime wt: WordType,
     comptime IL: u32,
     comptime EL: u32,
-    includes: [IL]*BitSet(wt),
-    excludes: [EL]*BitSet(wt),
+    includes: [IL]*Bitset(wt),
+    excludes: [EL]*Bitset(wt),
     ctx: *CommonOrderIds,
 ) bool {
-    const It = BitSet(wt).CommonIterator(IL, EL, *CommonOrderIds, commonOrderPushA, commonOrderPushI);
+    const It = Bitset(wt).CommonIterator(IL, EL, *CommonOrderIds, commonOrderPushA, commonOrderPushI);
     if (IL == 0 and EL == 0) return true;
     const words_len = if (IL > 0) includes[0].words.items.len else excludes[0].words.items.len;
     var wid: u32 = 0;
@@ -1464,8 +1464,8 @@ fn commonOracleIds(
     comptime wt: WordType,
     comptime IL: u32,
     comptime EL: u32,
-    includes: [IL]*BitSet(wt),
-    excludes: [EL]*BitSet(wt),
+    includes: [IL]*Bitset(wt),
+    excludes: [EL]*Bitset(wt),
     n: u32,
     out_a: *[256]u32,
     out_i: *[256]u32,
@@ -1501,7 +1501,7 @@ fn commonOracleIds(
     return .{ .na = na, .ni = ni };
 }
 
-fn commonPoisonPadding(comptime wt: WordType, comptime IL: u32, comptime EL: u32, includes: [IL]*BitSet(wt), excludes: [EL]*BitSet(wt), n: u32) void {
+fn commonPoisonPadding(comptime wt: WordType, comptime IL: u32, comptime EL: u32, includes: [IL]*Bitset(wt), excludes: [EL]*Bitset(wt), n: u32) void {
     if (n == 0) return;
     const BW = bit_word.BitWord(wt);
     const used = BW.bitIdInWord(n);
@@ -1523,16 +1523,16 @@ fn commonCheckOne(
     pats_inc: [IL]ResizePattern,
     pats_exc: [EL]ResizePattern,
 ) !void {
-    var inc_sets: [IL]BitSet(wt) = undefined;
-    var exc_sets: [EL]BitSet(wt) = undefined;
-    for (0..IL) |k| inc_sets[k] = try initBitSetPattern(wt, t.allocator, n, pats_inc[k]);
-    for (0..EL) |k| exc_sets[k] = try initBitSetPattern(wt, t.allocator, n, pats_exc[k]);
+    var inc_sets: [IL]Bitset(wt) = undefined;
+    var exc_sets: [EL]Bitset(wt) = undefined;
+    for (0..IL) |k| inc_sets[k] = try initBitsetPattern(wt, t.allocator, n, pats_inc[k]);
+    for (0..EL) |k| exc_sets[k] = try initBitsetPattern(wt, t.allocator, n, pats_exc[k]);
     defer {
         for (0..IL) |k| inc_sets[k].deinit(t.allocator);
         for (0..EL) |k| exc_sets[k].deinit(t.allocator);
     }
-    var inc_ptrs: [IL]*BitSet(wt) = undefined;
-    var exc_ptrs: [EL]*BitSet(wt) = undefined;
+    var inc_ptrs: [IL]*Bitset(wt) = undefined;
+    var exc_ptrs: [EL]*Bitset(wt) = undefined;
     for (0..IL) |k| inc_ptrs[k] = &inc_sets[k];
     for (0..EL) |k| exc_ptrs[k] = &exc_sets[k];
     commonPoisonPadding(wt, IL, EL, inc_ptrs, exc_ptrs, n);
@@ -1576,16 +1576,16 @@ fn commonCheckOne(
 }
 
 fn commonCheckOrder(comptime wt: WordType, comptime IL: u32, comptime EL: u32, n: u32, pats_inc: [IL]ResizePattern, pats_exc: [EL]ResizePattern) !void {
-    var inc_sets: [IL]BitSet(wt) = undefined;
-    var exc_sets: [EL]BitSet(wt) = undefined;
-    for (0..IL) |k| inc_sets[k] = try initBitSetPattern(wt, t.allocator, n, pats_inc[k]);
-    for (0..EL) |k| exc_sets[k] = try initBitSetPattern(wt, t.allocator, n, pats_exc[k]);
+    var inc_sets: [IL]Bitset(wt) = undefined;
+    var exc_sets: [EL]Bitset(wt) = undefined;
+    for (0..IL) |k| inc_sets[k] = try initBitsetPattern(wt, t.allocator, n, pats_inc[k]);
+    for (0..EL) |k| exc_sets[k] = try initBitsetPattern(wt, t.allocator, n, pats_exc[k]);
     defer {
         for (0..IL) |k| inc_sets[k].deinit(t.allocator);
         for (0..EL) |k| exc_sets[k].deinit(t.allocator);
     }
-    var inc_ptrs: [IL]*BitSet(wt) = undefined;
-    var exc_ptrs: [EL]*BitSet(wt) = undefined;
+    var inc_ptrs: [IL]*Bitset(wt) = undefined;
+    var exc_ptrs: [EL]*Bitset(wt) = undefined;
     for (0..IL) |k| inc_ptrs[k] = &inc_sets[k];
     for (0..EL) |k| exc_ptrs[k] = &exc_sets[k];
     commonPoisonPadding(wt, IL, EL, inc_ptrs, exc_ptrs, n);
@@ -1620,11 +1620,11 @@ fn commonCheckOrder(comptime wt: WordType, comptime IL: u32, comptime EL: u32, n
     try t.expectEqual(exp.ni, ii);
 }
 
-test "BitSet CommonIterator: spec example 2+2" {
-    var inc0 = BitSet(.u8){};
-    var inc1 = BitSet(.u8){};
-    var exc0 = BitSet(.u8){};
-    var exc1 = BitSet(.u8){};
+test "Bitset CommonIterator: spec example 2+2" {
+    var inc0 = Bitset(.u8){};
+    var inc1 = Bitset(.u8){};
+    var exc0 = Bitset(.u8){};
+    var exc1 = Bitset(.u8){};
     defer inc0.deinit(t.allocator);
     defer inc1.deinit(t.allocator);
     defer exc0.deinit(t.allocator);
@@ -1642,25 +1642,25 @@ test "BitSet CommonIterator: spec example 2+2" {
     exc0.active_bits_counter = @popCount(exc0.words.items[0]);
     exc1.active_bits_counter = @popCount(exc1.words.items[0]);
 
-    const inc_ptrs: [2]*BitSet(.u8) = .{ &inc0, &inc1 };
-    const exc_ptrs: [2]*BitSet(.u8) = .{ &exc0, &exc1 };
+    const inc_ptrs: [2]*Bitset(.u8) = .{ &inc0, &inc1 };
+    const exc_ptrs: [2]*Bitset(.u8) = .{ &exc0, &exc1 };
 
     {
-        const It = BitSet(.u8).CommonIterator(2, 2, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, stepPushA, stepPushI);
         var ctx = StepIds{};
         try t.expect(It.step(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ctx }, 0));
         try t.expectEqualSlices(u32, &[_]u32{1}, ctx.active[0..ctx.na]);
         try t.expectEqualSlices(u32, &[_]u32{0}, ctx.inactive[0..ctx.ni]);
     }
     {
-        const It = BitSet(.u8).CommonIterator(2, 2, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, stepPushA, stepPushI);
         var ctx = StepIds{};
         try t.expect(It.iterateAll(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ctx }));
         try t.expectEqualSlices(u32, &[_]u32{1}, ctx.active[0..ctx.na]);
         try t.expectEqualSlices(u32, &[_]u32{0}, ctx.inactive[0..ctx.ni]);
     }
     {
-        const It = BitSet(.u8).CommonIterator(2, 2, *StepIds, stepPushA, null);
+        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, stepPushA, null);
         var ctx = StepIds{};
         try t.expect(It.step(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ctx }, 0));
         try t.expectEqualSlices(u32, &[_]u32{1}, ctx.active[0..ctx.na]);
@@ -1670,7 +1670,7 @@ test "BitSet CommonIterator: spec example 2+2" {
         try t.expectEqualSlices(u32, &[_]u32{1}, ctx2.active[0..ctx2.na]);
     }
     {
-        const It = BitSet(.u8).CommonIterator(2, 2, *StepIds, null, stepPushI);
+        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, null, stepPushI);
         var ctx = StepIds{};
         try t.expect(It.step(.{ .includes = inc_ptrs, .excludes = exc_ptrs, .context = &ctx }, 0));
         try t.expectEqualSlices(u32, &[_]u32{0}, ctx.inactive[0..ctx.ni]);
@@ -1681,9 +1681,9 @@ test "BitSet CommonIterator: spec example 2+2" {
     }
 }
 
-test "BitSet CommonIterator: 1+1 truth table" {
-    var inc = BitSet(.u8){};
-    var exc = BitSet(.u8){};
+test "Bitset CommonIterator: 1+1 truth table" {
+    var inc = Bitset(.u8){};
+    var exc = Bitset(.u8){};
     defer inc.deinit(t.allocator);
     defer exc.deinit(t.allocator);
     try inc.resize(t.allocator, 4, .inactive);
@@ -1693,7 +1693,7 @@ test "BitSet CommonIterator: 1+1 truth table" {
     inc.active_bits_counter = @popCount(inc.words.items[0]);
     exc.active_bits_counter = @popCount(exc.words.items[0]);
 
-    const It = BitSet(.u8).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
+    const It = Bitset(.u8).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
     var ctx = StepIds{};
     try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
     try t.expectEqualSlices(u32, &[_]u32{2}, ctx.active[0..ctx.na]);
@@ -1706,8 +1706,8 @@ test "BitSet CommonIterator: 1+1 truth table" {
         .{ .inc_bit = 1, .exc_bit = 1, .want_a = false, .want_i = false },
     };
     for (combos) |c| {
-        var single_inc = BitSet(.u8){};
-        var single_exc = BitSet(.u8){};
+        var single_inc = Bitset(.u8){};
+        var single_exc = Bitset(.u8){};
         defer single_inc.deinit(t.allocator);
         defer single_exc.deinit(t.allocator);
         try single_inc.resize(t.allocator, 1, .inactive);
@@ -1723,7 +1723,7 @@ test "BitSet CommonIterator: 1+1 truth table" {
     }
 }
 
-test "BitSet CommonIterator: 1+0 matches Iterator" {
+test "Bitset CommonIterator: 1+0 matches Iterator" {
     const sizes = [_]u32{ 0, 1, 2, 7, 8, 9, 15, 16, 17, 63, 64, 65, 70, 128, 129, 200 };
     const patterns = [_]ResizePattern{ .zero, .one, .alt01, .alt10, .every3, .pseudo };
     for (sizes) |n| {
@@ -1740,7 +1740,7 @@ test "BitSet CommonIterator: 1+0 matches Iterator" {
 }
 
 fn commonCheckSingleMatchesIterator(comptime wt: WordType, n: u32, pat: ResizePattern) !void {
-    var bs = try initBitSetPattern(wt, t.allocator, n, pat);
+    var bs = try initBitsetPattern(wt, t.allocator, n, pat);
     defer bs.deinit(t.allocator);
     commonPoisonPadding(wt, 1, 0, .{&bs}, .{}, n);
 
@@ -1760,7 +1760,7 @@ fn commonCheckSingleMatchesIterator(comptime wt: WordType, n: u32, pat: ResizePa
         try t.expectEqualSlices(u32, a.inactive[0..a.ni], b.inactive[0..b.ni]);
     }
     {
-        const It = BitSet(wt).Iterator(*StepIds, stepPushA, stepPushI);
+        const It = Bitset(wt).Iterator(*StepIds, stepPushA, stepPushI);
         var ref = StepIds{};
         var wid: u32 = 0;
         while (wid < bs.words.items.len) : (wid += 1) {
@@ -1773,7 +1773,7 @@ fn commonCheckSingleMatchesIterator(comptime wt: WordType, n: u32, pat: ResizePa
     }
 }
 
-test "BitSet CommonIterator: 0+1 swapped Iterator" {
+test "Bitset CommonIterator: 0+1 swapped Iterator" {
     const sizes = [_]u32{ 0, 1, 2, 7, 8, 9, 15, 16, 17, 63, 64, 65, 70, 128, 129, 200 };
     const patterns = [_]ResizePattern{ .zero, .one, .alt01, .alt10, .every3, .pseudo };
     for (sizes) |n| {
@@ -1785,7 +1785,7 @@ test "BitSet CommonIterator: 0+1 swapped Iterator" {
 }
 
 fn commonCheckSwappedMatchesIterator(comptime wt: WordType, n: u32, pat: ResizePattern) !void {
-    var bs = try initBitSetPattern(wt, t.allocator, n, pat);
+    var bs = try initBitsetPattern(wt, t.allocator, n, pat);
     defer bs.deinit(t.allocator);
     commonPoisonPadding(wt, 0, 1, .{}, .{&bs}, n);
 
@@ -1805,10 +1805,10 @@ fn commonCheckSwappedMatchesIterator(comptime wt: WordType, n: u32, pat: ResizeP
     try t.expectEqualSlices(u32, got.inactive[0..got.ni], got_all.inactive[0..got_all.ni]);
 }
 
-test "BitSet CommonIterator: all active, all inactive, all gap" {
+test "Bitset CommonIterator: all active, all inactive, all gap" {
     {
-        var inc = BitSet(.u64){};
-        var exc = BitSet(.u64){};
+        var inc = Bitset(.u64){};
+        var exc = Bitset(.u64){};
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 70, .active);
@@ -1821,8 +1821,8 @@ test "BitSet CommonIterator: all active, all inactive, all gap" {
         try t.expectEqual(@as(u32, 69), ctx.active[69]);
     }
     {
-        var inc = BitSet(.u64){};
-        var exc = BitSet(.u64){};
+        var inc = Bitset(.u64){};
+        var exc = Bitset(.u64){};
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 70, .inactive);
@@ -1835,7 +1835,7 @@ test "BitSet CommonIterator: all active, all inactive, all gap" {
         try t.expectEqual(@as(u32, 69), ctx.inactive[69]);
     }
     {
-        var bs = try initBitSetPattern(.u64, t.allocator, 70, .pseudo);
+        var bs = try initBitsetPattern(.u64, t.allocator, 70, .pseudo);
         defer bs.deinit(t.allocator);
         var ctx = StepIds{};
         try t.expect(commonIterateAllCollect(.u64, 1, 1, stepPushA, stepPushI, .{&bs}, .{&bs}, &ctx));
@@ -1847,8 +1847,8 @@ test "BitSet CommonIterator: all active, all inactive, all gap" {
         try t.expectEqual(@as(usize, 0), ctx_step.ni);
     }
     {
-        var inc = BitSet(.u8){};
-        var exc = BitSet(.u8){};
+        var inc = Bitset(.u8){};
+        var exc = Bitset(.u8){};
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 8, .active);
@@ -1860,7 +1860,7 @@ test "BitSet CommonIterator: all active, all inactive, all gap" {
     }
 }
 
-test "BitSet CommonIterator: oracle corners 2+2" {
+test "Bitset CommonIterator: oracle corners 2+2" {
     const sizes_u64 = [_]u32{ 0, 1, 2, 7, 8, 9, 63, 64, 65, 70, 129, 200 };
     const sizes_u8 = [_]u32{ 0, 1, 7, 8, 9, 16, 17, 24 };
     const pats = [_]ResizePattern{ .zero, .one, .alt01, .pseudo };
@@ -1888,7 +1888,7 @@ test "BitSet CommonIterator: oracle corners 2+2" {
     }
 }
 
-test "BitSet CommonIterator: oracle corners 1+1 exhaustive patterns" {
+test "Bitset CommonIterator: oracle corners 1+1 exhaustive patterns" {
     const sizes = [_]u32{ 0, 1, 2, 7, 8, 9, 16, 17, 63, 64, 65, 70, 129 };
     const patterns = [_]ResizePattern{ .zero, .one, .alt01, .alt10, .every3, .pseudo };
     for (sizes) |n| {
@@ -1901,7 +1901,7 @@ test "BitSet CommonIterator: oracle corners 1+1 exhaustive patterns" {
     }
 }
 
-test "BitSet CommonIterator: oracle corners mixed lens" {
+test "Bitset CommonIterator: oracle corners mixed lens" {
     const sizes = [_]u32{ 0, 1, 8, 9, 17, 64, 65, 70, 130 };
     const pats = [_]ResizePattern{ .zero, .one, .alt01, .pseudo };
     for (sizes) |n| {
@@ -1921,7 +1921,7 @@ test "BitSet CommonIterator: oracle corners mixed lens" {
     }
 }
 
-test "BitSet CommonIterator: oracle word types u16/u32" {
+test "Bitset CommonIterator: oracle word types u16/u32" {
     const sizes16 = [_]u32{ 0, 1, 15, 16, 17, 33 };
     const sizes32 = [_]u32{ 0, 1, 31, 32, 33, 65 };
     const pats = [_]ResizePattern{ .zero, .one, .alt01, .pseudo };
@@ -1943,7 +1943,7 @@ test "BitSet CommonIterator: oracle word types u16/u32" {
     }
 }
 
-test "BitSet CommonIterator: boundary oracle u64" {
+test "Bitset CommonIterator: boundary oracle u64" {
     const bounds = [_]u32{ 0, 1, 2, 63, 64, 65, 70, 100, 126, 127, 128, 129, 130, 191, 192, 193, 200 };
     const pats = [_]ResizePattern{ .zero, .one, .alt01, .alt10, .every3, .pseudo };
     for (bounds) |n| {
@@ -1954,16 +1954,16 @@ test "BitSet CommonIterator: boundary oracle u64" {
     }
 }
 
-test "BitSet CommonIterator: fuzz vs oracle" {
+test "Bitset CommonIterator: fuzz vs oracle" {
     var rng: u64 = 0x9E3779B97F4A7C15;
     var step: usize = 0;
     while (step < 300) : (step += 1) {
         const n: u32 = nextRandU32(&rng) % 201;
         errdefer std.debug.print("COMMON FUZZ u64 2+2 fail step={} n={}\n", .{ step, n });
-        var inc_sets: [2]BitSet(.u64) = undefined;
-        var exc_sets: [2]BitSet(.u64) = undefined;
-        for (0..2) |k| inc_sets[k] = BitSet(.u64){};
-        for (0..2) |k| exc_sets[k] = BitSet(.u64){};
+        var inc_sets: [2]Bitset(.u64) = undefined;
+        var exc_sets: [2]Bitset(.u64) = undefined;
+        for (0..2) |k| inc_sets[k] = Bitset(.u64){};
+        for (0..2) |k| exc_sets[k] = Bitset(.u64){};
         defer {
             for (0..2) |k| inc_sets[k].deinit(t.allocator);
             for (0..2) |k| exc_sets[k].deinit(t.allocator);
@@ -2022,16 +2022,16 @@ test "BitSet CommonIterator: fuzz vs oracle" {
     }
 }
 
-test "BitSet CommonIterator: fuzz vs oracle u8 3+3" {
+test "Bitset CommonIterator: fuzz vs oracle u8 3+3" {
     var rng: u64 = 0x123456789ABCDEF;
     var step: usize = 0;
     while (step < 200) : (step += 1) {
         const n: u32 = nextRandU32(&rng) % 41;
         errdefer std.debug.print("COMMON FUZZ u8 3+3 fail step={} n={}\n", .{ step, n });
-        var inc_sets: [3]BitSet(.u8) = undefined;
-        var exc_sets: [3]BitSet(.u8) = undefined;
-        for (0..3) |k| inc_sets[k] = BitSet(.u8){};
-        for (0..3) |k| exc_sets[k] = BitSet(.u8){};
+        var inc_sets: [3]Bitset(.u8) = undefined;
+        var exc_sets: [3]Bitset(.u8) = undefined;
+        for (0..3) |k| inc_sets[k] = Bitset(.u8){};
+        for (0..3) |k| exc_sets[k] = Bitset(.u8){};
         defer {
             for (0..3) |k| inc_sets[k].deinit(t.allocator);
             for (0..3) |k| exc_sets[k].deinit(t.allocator);
@@ -2076,12 +2076,12 @@ test "BitSet CommonIterator: fuzz vs oracle u8 3+3" {
     }
 }
 
-test "BitSet CommonIterator: null side is skipped" {
+test "Bitset CommonIterator: null side is skipped" {
     {
-        var inc0 = BitSet(.u64){};
-        var inc1 = BitSet(.u64){};
-        var exc0 = BitSet(.u64){};
-        var exc1 = BitSet(.u64){};
+        var inc0 = Bitset(.u64){};
+        var inc1 = Bitset(.u64){};
+        var exc0 = Bitset(.u64){};
+        var exc1 = Bitset(.u64){};
         defer inc0.deinit(t.allocator);
         defer inc1.deinit(t.allocator);
         defer exc0.deinit(t.allocator);
@@ -2104,8 +2104,8 @@ test "BitSet CommonIterator: null side is skipped" {
         try t.expectEqualSlices(u32, &[_]u32{5}, ctx_all.active[0..ctx_all.na]);
     }
     {
-        var inc = BitSet(.u8){};
-        var exc = BitSet(.u8){};
+        var inc = Bitset(.u8){};
+        var exc = Bitset(.u8){};
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 10, .inactive);
@@ -2121,15 +2121,15 @@ test "BitSet CommonIterator: null side is skipped" {
     }
 }
 
-test "BitSet CommonIterator: early exit stops the walk" {
+test "Bitset CommonIterator: early exit stops the walk" {
     {
-        var inc = BitSet(.u64){};
-        var exc = BitSet(.u64){};
+        var inc = Bitset(.u64){};
+        var exc = Bitset(.u64){};
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 70, .active);
         try exc.resize(t.allocator, 70, .inactive);
-        const It = BitSet(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
         var ctx = StepIds{ .stop_after = 3 };
         try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 3), ctx.na);
@@ -2137,28 +2137,28 @@ test "BitSet CommonIterator: early exit stops the walk" {
         try t.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, ctx.active[0..ctx.na]);
     }
     {
-        var inc = BitSet(.u64){};
-        var exc = BitSet(.u64){};
+        var inc = Bitset(.u64){};
+        var exc = Bitset(.u64){};
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 10, .inactive);
         try exc.resize(t.allocator, 10, .inactive);
         inc.setBit(0, .active);
         exc.setBit(5, .active);
-        const It = BitSet(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
         var ctx = StepIds{ .stop_after = 2 };
         try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqualSlices(u32, &[_]u32{0}, ctx.active[0..ctx.na]);
         try t.expectEqualSlices(u32, &[_]u32{5}, ctx.inactive[0..ctx.ni]);
     }
     {
-        var inc = BitSet(.u64){};
-        var exc = BitSet(.u64){};
+        var inc = Bitset(.u64){};
+        var exc = Bitset(.u64){};
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 130, .active);
         try exc.resize(t.allocator, 130, .inactive);
-        const It = BitSet(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
         var ctx = StepIds{ .stop_after = 70 };
         try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 64), ctx.na);
@@ -2168,22 +2168,22 @@ test "BitSet CommonIterator: early exit stops the walk" {
         try t.expectEqual(@as(u32, 69), ctx.active[69]);
     }
     {
-        var inc = BitSet(.u64){};
-        var exc = BitSet(.u64){};
+        var inc = Bitset(.u64){};
+        var exc = Bitset(.u64){};
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 10, .active);
         try exc.resize(t.allocator, 10, .inactive);
-        const It = BitSet(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
         var ctx = StepIds{ .stop_after = 1 };
         try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 1), ctx.na);
     }
     {
-        var inc0 = BitSet(.u8){};
-        var inc1 = BitSet(.u8){};
-        var exc0 = BitSet(.u8){};
-        var exc1 = BitSet(.u8){};
+        var inc0 = Bitset(.u8){};
+        var inc1 = Bitset(.u8){};
+        var exc0 = Bitset(.u8){};
+        var exc1 = Bitset(.u8){};
         defer inc0.deinit(t.allocator);
         defer inc1.deinit(t.allocator);
         defer exc0.deinit(t.allocator);
@@ -2196,7 +2196,7 @@ test "BitSet CommonIterator: early exit stops the walk" {
         inc1.words.items[0] = 0b0110_1110;
         exc0.words.items[0] = 0b1100_0101;
         exc1.words.items[0] = 0b0001_1101;
-        const It = BitSet(.u8).CommonIterator(2, 2, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u8).CommonIterator(2, 2, *StepIds, stepPushA, stepPushI);
         var ctx = StepIds{ .stop_after = 1 };
         try t.expect(!It.step(.{ .includes = .{ &inc0, &inc1 }, .excludes = .{ &exc0, &exc1 }, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 0), ctx.na);
@@ -2212,25 +2212,25 @@ test "BitSet CommonIterator: early exit stops the walk" {
         try t.expectEqual(@as(usize, 1), ctx3.ni);
     }
     {
-        var inc = BitSet(.u64){};
-        var exc = BitSet(.u64){};
+        var inc = Bitset(.u64){};
+        var exc = Bitset(.u64){};
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 130, .active);
         try exc.resize(t.allocator, 130, .inactive);
-        const It = BitSet(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
+        const It = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, stepPushI);
         var ctx = StepIds{ .stop_after = 70 };
         try t.expect(!It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }));
         try t.expectEqual(@as(usize, 70), ctx.na);
     }
     {
-        var inc = BitSet(.u64){};
-        var exc = BitSet(.u64){};
+        var inc = Bitset(.u64){};
+        var exc = Bitset(.u64){};
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 130, .inactive);
         try exc.resize(t.allocator, 130, .active);
-        const ItI = BitSet(.u64).CommonIterator(1, 1, *StepIds, null, stepPushI);
+        const ItI = Bitset(.u64).CommonIterator(1, 1, *StepIds, null, stepPushI);
         var only_i = StepIds{ .stop_after = 1 };
         try t.expect(!ItI.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &only_i }));
         try t.expectEqual(@as(usize, 1), only_i.ni);
@@ -2238,33 +2238,33 @@ test "BitSet CommonIterator: early exit stops the walk" {
         var only_i_full = StepIds{};
         try t.expect(ItI.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &only_i_full }));
         try t.expectEqual(@as(usize, 130), only_i_full.ni);
-        const ItA = BitSet(.u64).CommonIterator(1, 1, *StepIds, stepPushA, null);
+        const ItA = Bitset(.u64).CommonIterator(1, 1, *StepIds, stepPushA, null);
         var only_a_full = StepIds{};
         try t.expect(ItA.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &only_a_full }));
         try t.expectEqual(@as(usize, 0), only_a_full.na);
     }
 }
 
-test "BitSet CommonIterator: iterateAll parity with per-word step + oracle" {
+test "Bitset CommonIterator: iterateAll parity with per-word step + oracle" {
     const sizes = [_]u32{ 0, 1, 2, 7, 8, 9, 63, 64, 65, 70, 128, 129, 200 };
     const pats = [_]ResizePattern{ .zero, .one, .alt01, .pseudo };
     for (sizes) |n| {
         for (pats) |p0| {
             for (pats) |p1| {
-                var inc_sets: [2]BitSet(.u64) = .{
-                    try initBitSetPattern(.u64, t.allocator, n, p0),
-                    try initBitSetPattern(.u64, t.allocator, n, p1),
+                var inc_sets: [2]Bitset(.u64) = .{
+                    try initBitsetPattern(.u64, t.allocator, n, p0),
+                    try initBitsetPattern(.u64, t.allocator, n, p1),
                 };
-                var exc_sets: [2]BitSet(.u64) = .{
-                    try initBitSetPattern(.u64, t.allocator, n, p1),
-                    try initBitSetPattern(.u64, t.allocator, n, p0),
+                var exc_sets: [2]Bitset(.u64) = .{
+                    try initBitsetPattern(.u64, t.allocator, n, p1),
+                    try initBitsetPattern(.u64, t.allocator, n, p0),
                 };
                 defer {
                     for (0..2) |k| inc_sets[k].deinit(t.allocator);
                     for (0..2) |k| exc_sets[k].deinit(t.allocator);
                 }
-                const inc_ptrs: [2]*BitSet(.u64) = .{ &inc_sets[0], &inc_sets[1] };
-                const exc_ptrs: [2]*BitSet(.u64) = .{ &exc_sets[0], &exc_sets[1] };
+                const inc_ptrs: [2]*Bitset(.u64) = .{ &inc_sets[0], &inc_sets[1] };
+                const exc_ptrs: [2]*Bitset(.u64) = .{ &exc_sets[0], &exc_sets[1] };
                 commonPoisonPadding(.u64, 2, 2, inc_ptrs, exc_ptrs, n);
                 var a = StepIds{};
                 var b = StepIds{};
@@ -2281,8 +2281,8 @@ test "BitSet CommonIterator: iterateAll parity with per-word step + oracle" {
         }
     }
     {
-        var inc = BitSet(.u64){};
-        var exc = BitSet(.u64){};
+        var inc = Bitset(.u64){};
+        var exc = Bitset(.u64){};
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 10, .inactive);
@@ -2300,12 +2300,12 @@ test "BitSet CommonIterator: iterateAll parity with per-word step + oracle" {
     }
 }
 
-test "BitSet CommonIterator: empty sets and zero lens" {
+test "Bitset CommonIterator: empty sets and zero lens" {
     {
-        var inc0 = BitSet(.u64){};
-        var inc1 = BitSet(.u64){};
-        var exc0 = BitSet(.u64){};
-        var exc1 = BitSet(.u64){};
+        var inc0 = Bitset(.u64){};
+        var inc1 = Bitset(.u64){};
+        var exc0 = Bitset(.u64){};
+        var exc1 = Bitset(.u64){};
         defer inc0.deinit(t.allocator);
         defer inc1.deinit(t.allocator);
         defer exc0.deinit(t.allocator);
@@ -2325,7 +2325,7 @@ test "BitSet CommonIterator: empty sets and zero lens" {
         try t.expectEqual(@as(usize, 0), ctx4.ni);
     }
     {
-        const It00 = BitSet(.u64).CommonIterator(0, 0, *StepIds, stepPushA, stepPushI);
+        const It00 = Bitset(.u64).CommonIterator(0, 0, *StepIds, stepPushA, stepPushI);
         var ctx = StepIds{};
         try t.expect(It00.step(.{ .includes = .{}, .excludes = .{}, .context = &ctx }, 0));
         try t.expect(It00.iterateAll(.{ .includes = .{}, .excludes = .{}, .context = &ctx }));
@@ -2333,7 +2333,7 @@ test "BitSet CommonIterator: empty sets and zero lens" {
         try t.expectEqual(@as(usize, 0), ctx.ni);
     }
     {
-        var exc = BitSet(.u8){};
+        var exc = Bitset(.u8){};
         defer exc.deinit(t.allocator);
         try exc.resize(t.allocator, 10, .inactive);
         exc.setBit(5, .active);
@@ -2344,7 +2344,7 @@ test "BitSet CommonIterator: empty sets and zero lens" {
         for (ctx.active[0..ctx.na]) |id| try t.expect(id != 5);
     }
     {
-        var inc = BitSet(.u8){};
+        var inc = Bitset(.u8){};
         defer inc.deinit(t.allocator);
         try inc.resize(t.allocator, 10, .inactive);
         inc.setBit(3, .active);
@@ -2356,11 +2356,11 @@ test "BitSet CommonIterator: empty sets and zero lens" {
     }
 }
 
-test "BitSet CommonIterator: tail bound never leaks padding" {
+test "Bitset CommonIterator: tail bound never leaks padding" {
     const tails = [_]u32{ 1, 2, 63, 65, 70, 127, 129, 130, 193, 200 };
     for (tails) |n| {
-        var inc = BitSet(.u64){};
-        var exc = BitSet(.u64){};
+        var inc = Bitset(.u64){};
+        var exc = Bitset(.u64){};
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, n, .active);
@@ -2377,8 +2377,8 @@ test "BitSet CommonIterator: tail bound never leaks padding" {
         try t.expectEqualSlices(u32, ctx.active[0..ctx.na], step_ctx.active[0..step_ctx.na]);
     }
     {
-        var inc = BitSet(.u64){};
-        var exc = BitSet(.u64){};
+        var inc = Bitset(.u64){};
+        var exc = Bitset(.u64){};
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 65, .inactive);
@@ -2392,8 +2392,8 @@ test "BitSet CommonIterator: tail bound never leaks padding" {
         try t.expectEqual(@as(u32, 64), ctx.inactive[ctx.ni - 1]);
     }
     {
-        var inc = BitSet(.u8){};
-        var exc = BitSet(.u8){};
+        var inc = Bitset(.u8){};
+        var exc = Bitset(.u8){};
         defer inc.deinit(t.allocator);
         defer exc.deinit(t.allocator);
         try inc.resize(t.allocator, 10, .active);
@@ -2407,7 +2407,7 @@ test "BitSet CommonIterator: tail bound never leaks padding" {
     }
 }
 
-test "BitSet CommonIterator: global order is ascending" {
+test "Bitset CommonIterator: global order is ascending" {
     const sizes = [_]u32{ 1, 8, 9, 17, 64, 65, 70, 130 };
     const pats = [_]ResizePattern{ .alt01, .alt10, .every3, .pseudo };
     for (sizes) |n| {

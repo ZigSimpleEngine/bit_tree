@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     for ([_][]const u8{
-        "src/bit_set.zig",
+        "src/bitset.zig",
         "src/layer.zig",
         "src/bit_word.zig",
         "src/bit_tree.zig",

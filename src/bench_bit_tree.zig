@@ -1,12 +1,12 @@
 const std = @import("std");
-const bit_set = @import("bit_set.zig");
+const bitset = @import("bitset.zig");
 const utilities = @import("utilities.zig");
 const bit_tree = @import("bit_tree.zig");
 
 /// Allocator type that owns benchmark and history buffers.
 const Allocator = std.mem.Allocator;
 /// Reference flat set used only to verify tree results.
-const Oracle = bit_set.BitSet(.u64);
+const Oracle = bitset.Bitset(.u64);
 /// Logical bit value selecting active or inactive benchmarks.
 const BitState = utilities.BitState;
 /// Measured hierarchical tree built from identical inputs.

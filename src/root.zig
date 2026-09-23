@@ -1,5 +1,5 @@
 /// Flat bitset plane, owns backing words and active-bit counts.
-pub const bit_set = @import("bit_set.zig");
+pub const bitset = @import("bitset.zig");
 /// Pyramid summary level with activity and mixed planes.
 pub const layer = @import("layer.zig");
 /// Compile-time word arithmetic kit for all widths.
@@ -10,7 +10,7 @@ pub const utilities = @import("utilities.zig");
 pub const bit_tree = @import("bit_tree.zig");
 
 /// Flat bitset type factory, backing store for the tree leaves.
-pub const BitSet = bit_set.BitSet;
+pub const Bitset = bitset.Bitset;
 /// Pyramid level type factory, aggregates leaf summaries.
 pub const Layer = layer.Layer;
 /// Backing integer width selector for all containers.
