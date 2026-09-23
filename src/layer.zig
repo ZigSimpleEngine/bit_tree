@@ -541,6 +541,21 @@ pub fn Layer(comptime wt: WordType) type {
             self.state_counters[State.deep_mixed_u32] = self.state_counters[State.deep_mixed_u32] - o.deep + n.deep;
         }
 
+        /// Reads one summary position without touching counters.
+        /// - `self` - level to read.
+        /// - `id` - bit position to read.
+        ///
+        /// Return - stored summary state.
+        pub fn getBit(self: *const Self, id: u32) State {
+            std.debug.assert(id < self.bits_count);
+            const word_id = bw.bitToWordId(id);
+            const bit_id_in_word = bw.bitIdInWord(id);
+            return State.fromBitsState(
+                bw.readBitState(self.activity.items[word_id], bit_id_in_word),
+                bw.readBitState(self.mixed.items[word_id], bit_id_in_word),
+            );
+        }
+
         /// Writes one summary position and moves its counter.
         /// - `self` - level to update.
         /// - `id` - bit position to write.
@@ -2025,4 +2040,60 @@ test "Layer CommonIterator: global order is ascending" {
     try commonCheckOrder(.u64, 1, 0, 70, .{.pseudo}, .{});
     try commonCheckOrder(.u64, 0, 1, 70, .{}, .{.pseudo});
     try commonCheckOrder(.u64, 3, 3, 130, .{ .cycle4, .sparse_deep, .pseudo }, .{ .pseudo, .all_deep, .all_inactive });
+}
+
+test "Layer getBit: defaults and set/get roundtrip" {
+    const L64 = Layer(.u64);
+    var layer: L64 = .{};
+    defer layer.deinit(t.allocator);
+    try layer.resize(t.allocator, 130, .inactive);
+
+    try t.expectEqual(L64.State.inactive, layer.getBit(0));
+    try t.expectEqual(L64.State.inactive, layer.getBit(63));
+    try t.expectEqual(L64.State.inactive, layer.getBit(64));
+    try t.expectEqual(L64.State.inactive, layer.getBit(129));
+
+    layer.setBit(0, .active);
+    layer.setBit(1, .mixed);
+    layer.setBit(63, .deep_mixed);
+    layer.setBit(64, .active);
+    layer.setBit(129, .mixed);
+
+    try t.expectEqual(L64.State.active, layer.getBit(0));
+    try t.expectEqual(L64.State.mixed, layer.getBit(1));
+    try t.expectEqual(L64.State.deep_mixed, layer.getBit(63));
+    try t.expectEqual(L64.State.active, layer.getBit(64));
+    try t.expectEqual(L64.State.mixed, layer.getBit(129));
+
+    try t.expectEqual(L64.State.inactive, layer.getBit(2));
+    try t.expectEqual(L64.State.inactive, layer.getBit(65));
+
+    layer.setBit(1, .deep_mixed);
+    try t.expectEqual(L64.State.deep_mixed, layer.getBit(1));
+
+    const before = layer.state_counters;
+    _ = layer.getBit(0);
+    _ = layer.getBit(64);
+    try t.expectEqualSlices(u32, &before, &layer.state_counters);
+
+    const clayer: *const L64 = &layer;
+    try t.expectEqual(L64.State.active, clayer.getBit(0));
+    try t.expectEqual(L64.State.deep_mixed, clayer.getBit(1));
+}
+
+test "Layer getBit: u8 all four states" {
+    const L8 = Layer(.u8);
+    var layer: L8 = .{};
+    defer layer.deinit(t.allocator);
+    try layer.resize(t.allocator, 4, .inactive);
+
+    layer.setBit(0, .inactive);
+    layer.setBit(1, .active);
+    layer.setBit(2, .mixed);
+    layer.setBit(3, .deep_mixed);
+
+    try t.expectEqual(L8.State.inactive, layer.getBit(0));
+    try t.expectEqual(L8.State.active, layer.getBit(1));
+    try t.expectEqual(L8.State.mixed, layer.getBit(2));
+    try t.expectEqual(L8.State.deep_mixed, layer.getBit(3));
 }

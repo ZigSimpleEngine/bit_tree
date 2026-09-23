@@ -569,6 +569,18 @@ pub fn Bitset(comptime wt: WordType) type {
             self.active_bits_counter = self.active_bits_counter - old_active + new_active;
         }
 
+        /// Reads one bit without touching the active counter.
+        /// - `self` - bitset to read.
+        /// - `id` - global bit position to read.
+        ///
+        /// Return - stored bit state.
+        pub fn getBit(self: *const Self, id: u32) BitState {
+            std.debug.assert(id < self.bits_count);
+            const word_id = bw.bitToWordId(id);
+            const bit_id_in_word = bw.bitIdInWord(id);
+            return bw.readBitState(self.words.items[word_id], bit_id_in_word);
+        }
+
         /// Writes one bit and moves the active counter.
         /// - `self` - bitset to update.
         /// - `id` - global bit position to write.
@@ -2421,4 +2433,61 @@ test "Bitset CommonIterator: global order is ascending" {
     try commonCheckOrder(.u64, 1, 0, 70, .{.pseudo}, .{});
     try commonCheckOrder(.u64, 0, 1, 70, .{}, .{.pseudo});
     try commonCheckOrder(.u64, 3, 3, 130, .{ .alt01, .every3, .pseudo }, .{ .pseudo, .alt10, .zero });
+}
+
+test "Bitset getBit: defaults and set/get roundtrip" {
+    var bs = Bitset(.u64){};
+    defer bs.deinit(t.allocator);
+    try bs.resize(t.allocator, 130, .inactive);
+
+    try t.expectEqual(BitState.inactive, bs.getBit(0));
+    try t.expectEqual(BitState.inactive, bs.getBit(63));
+    try t.expectEqual(BitState.inactive, bs.getBit(64));
+    try t.expectEqual(BitState.inactive, bs.getBit(129));
+
+    bs.setBit(0, .active);
+    bs.setBit(63, .active);
+    bs.setBit(64, .active);
+    bs.setBit(129, .active);
+
+    try t.expectEqual(BitState.active, bs.getBit(0));
+    try t.expectEqual(BitState.active, bs.getBit(63));
+    try t.expectEqual(BitState.active, bs.getBit(64));
+    try t.expectEqual(BitState.active, bs.getBit(129));
+
+    try t.expectEqual(BitState.inactive, bs.getBit(1));
+    try t.expectEqual(BitState.inactive, bs.getBit(62));
+    try t.expectEqual(BitState.inactive, bs.getBit(65));
+    try t.expectEqual(BitState.inactive, bs.getBit(128));
+
+    bs.setBit(63, .inactive);
+    try t.expectEqual(BitState.inactive, bs.getBit(63));
+    try t.expectEqual(BitState.active, bs.getBit(64));
+
+    const before = bs.active_bits_counter;
+    _ = bs.getBit(0);
+    _ = bs.getBit(64);
+    try t.expectEqual(before, bs.active_bits_counter);
+
+    const cbs: *const Bitset(.u64) = &bs;
+    try t.expectEqual(BitState.active, cbs.getBit(0));
+    try t.expectEqual(BitState.inactive, cbs.getBit(63));
+}
+
+test "Bitset getBit: u8 small word" {
+    var bs = Bitset(.u8){};
+    defer bs.deinit(t.allocator);
+    try bs.resize(t.allocator, 10, .inactive);
+
+    bs.setBit(0, .active);
+    bs.setBit(7, .active);
+    bs.setBit(8, .active);
+    bs.setBit(9, .active);
+
+    try t.expectEqual(BitState.active, bs.getBit(0));
+    try t.expectEqual(BitState.active, bs.getBit(7));
+    try t.expectEqual(BitState.active, bs.getBit(8));
+    try t.expectEqual(BitState.active, bs.getBit(9));
+    try t.expectEqual(BitState.inactive, bs.getBit(1));
+    try t.expectEqual(BitState.inactive, bs.getBit(6));
 }
