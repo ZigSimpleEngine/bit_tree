@@ -166,7 +166,7 @@ pub fn Layer(comptime wt: WordType) type {
                 /// - `word_id` - word index to scan.
                 ///
                 /// Return - false on early exit, true when the word completed.
-                pub inline fn step(data: LayerWithContext(Context), word_id: u32) bool {
+                pub inline fn step(data: LayerWithContext(Context), word_id: u32) anyerror!bool {
                     if (on_inactive != null and on_active != null and on_mixed != null and on_deep_mixed != null) {
                         return stepFull(data, word_id);
                     } else {
@@ -180,7 +180,7 @@ pub fn Layer(comptime wt: WordType) type {
                 /// - `end_bit` - range edge or null for no upper limit.
                 ///
                 /// Return - false on early exit, true when the scan completed.
-                pub inline fn iterateAll(data: LayerWithContext(Context), start_bit: ?u32, end_bit: ?u32) bool {
+                pub inline fn iterateAll(data: LayerWithContext(Context), start_bit: ?u32, end_bit: ?u32) anyerror!bool {
                     const layer = data.layer;
                     if (layer.activity.items.len == 0) return true;
                     const range = utilities.resolveRange(layer.bits_count, start_bit, end_bit);
@@ -192,7 +192,7 @@ pub fn Layer(comptime wt: WordType) type {
                         const w_base = bw.wordToBitId(@truncate(wid));
                         const s = @max(range.lo, w_base) - w_base;
                         const e = @min(range.hi, w_base + bw.word_type_bits) - w_base;
-                        if (!stepRange(data, @truncate(wid), s, e)) return false;
+                        if (!try stepRange(data, @truncate(wid), s, e)) return false;
                         if (wid == (if (direction == .forward) hi_word else lo_word)) break;
                         wid = if (direction == .forward) wid + 1 else wid - 1;
                     }
@@ -206,7 +206,7 @@ pub fn Layer(comptime wt: WordType) type {
                 /// - `sub_hi` - one past the last visited lane, exclusive.
                 ///
                 /// Return - false on early exit, true when the lanes completed.
-                inline fn stepRange(data: LayerWithContext(Context), word_id: u32, sub_lo: u32, sub_hi: u32) bool {
+                inline fn stepRange(data: LayerWithContext(Context), word_id: u32, sub_lo: u32, sub_hi: u32) anyerror!bool {
                     const layer = data.layer;
                     const context = data.context;
                     std.debug.assert(word_id < layer.activity.items.len);
@@ -220,13 +220,13 @@ pub fn Layer(comptime wt: WordType) type {
                         if (direction == .forward) {
                             var i: u32 = sub_lo;
                             while (i < sub_hi) : (i += 1) {
-                                if (!visitLane(context, start + i, activity_word, mixed_word, i)) return false;
+                                if (!try visitLane(context, start + i, activity_word, mixed_word, i)) return false;
                             }
                         } else {
                             var i: u32 = sub_hi;
                             while (i > sub_lo) {
                                 i -= 1;
-                                if (!visitLane(context, start + i, activity_word, mixed_word, i)) return false;
+                                if (!try visitLane(context, start + i, activity_word, mixed_word, i)) return false;
                             }
                         }
                         return true;
@@ -247,14 +247,14 @@ pub fn Layer(comptime wt: WordType) type {
                         while (pending_word != 0) {
                             const bit_id_in_word: u32 = @ctz(pending_word);
                             pending_word &= pending_word - 1;
-                            if (!visitPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
+                            if (!try visitPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
                         }
                     } else {
                         while (pending_word != 0) {
                             const lz: u32 = @clz(pending_word);
                             const bit_id_in_word = bw.word_type_bits - 1 - lz;
                             pending_word ^= @as(Word, 1) << @truncate(bit_id_in_word);
-                            if (!visitPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
+                            if (!try visitPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
                         }
                     }
                     return true;
@@ -268,24 +268,24 @@ pub fn Layer(comptime wt: WordType) type {
                 /// - `i` - lane index inside the word.
                 ///
                 /// Return - false on early exit, true to continue.
-                inline fn visitLane(context: Context, bit_id: u32, activity_word: Word, mixed_word: Word, i: u32) bool {
+                inline fn visitLane(context: Context, bit_id: u32, activity_word: Word, mixed_word: Word, i: u32) anyerror!bool {
                     const abit: u1 = @truncate(activity_word >> @truncate(i));
                     const mbit: u1 = @truncate(mixed_word >> @truncate(i));
                     if (abit == 0 and mbit == 0) {
                         if (on_inactive) |f| {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                         }
                     } else if (abit == 1 and mbit == 0) {
                         if (on_active) |f| {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                         }
                     } else if (abit == 0) {
                         if (on_mixed) |f| {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                         }
                     } else {
                         if (on_deep_mixed) |f| {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                         }
                     }
                     return true;
@@ -301,29 +301,29 @@ pub fn Layer(comptime wt: WordType) type {
                 /// - `only_deep_mixed` - masked deeply mixed lanes.
                 ///
                 /// Return - false on early exit, true to continue.
-                inline fn visitPendingLane(context: Context, bit_id: u32, bit_id_in_word: u32, only_inactive_word: Word, only_active_word: Word, only_mixed_word: Word, only_deep_mixed: Word) bool {
+                inline fn visitPendingLane(context: Context, bit_id: u32, bit_id_in_word: u32, only_inactive_word: Word, only_active_word: Word, only_mixed_word: Word, only_deep_mixed: Word) anyerror!bool {
                     const bit: Word = @as(Word, 1) << @truncate(bit_id_in_word);
                     if (on_inactive) |f| {
                         if ((only_inactive_word & bit) != 0) {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                             return true;
                         }
                     }
                     if (on_active) |f| {
                         if ((only_active_word & bit) != 0) {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                             return true;
                         }
                     }
                     if (on_mixed) |f| {
                         if ((only_mixed_word & bit) != 0) {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                             return true;
                         }
                     }
                     if (on_deep_mixed) |f| {
                         if ((only_deep_mixed & bit) != 0) {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                             return true;
                         }
                     }
@@ -349,7 +349,7 @@ pub fn Layer(comptime wt: WordType) type {
                 /// - `word_id` - word index to scan.
                 ///
                 /// Return - false on early exit, true when the word completed.
-                inline fn stepFull(data: LayerWithContext(Context), word_id: u32) bool {
+                inline fn stepFull(data: LayerWithContext(Context), word_id: u32) anyerror!bool {
                     const layer = data.layer;
                     const context = data.context;
                     std.debug.assert(word_id < layer.activity.items.len);
@@ -366,13 +366,13 @@ pub fn Layer(comptime wt: WordType) type {
                     if (direction == .forward) {
                         var i: u32 = 0;
                         while (i < bound) : (i += 1) {
-                            if (!visitLane(context, start + i, activity_word, mixed_word, i)) return false;
+                            if (!try visitLane(context, start + i, activity_word, mixed_word, i)) return false;
                         }
                     } else {
                         var i: u32 = bound;
                         while (i > 0) {
                             i -= 1;
-                            if (!visitLane(context, start + i, activity_word, mixed_word, i)) return false;
+                            if (!try visitLane(context, start + i, activity_word, mixed_word, i)) return false;
                         }
                     }
                     return true;
@@ -384,7 +384,7 @@ pub fn Layer(comptime wt: WordType) type {
                 /// - `word_id` - word index to scan.
                 ///
                 /// Return - false on early exit, true when the word completed.
-                inline fn stepPending(data: LayerWithContext(Context), word_id: u32) bool {
+                inline fn stepPending(data: LayerWithContext(Context), word_id: u32) anyerror!bool {
                     const layer = data.layer;
                     const context = data.context;
                     std.debug.assert(word_id < layer.activity.items.len);
@@ -417,14 +417,14 @@ pub fn Layer(comptime wt: WordType) type {
                         while (pending_word != 0) {
                             const bit_id_in_word: u32 = @ctz(pending_word);
                             pending_word &= pending_word - 1;
-                            if (!visitPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
+                            if (!try visitPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
                         }
                     } else {
                         while (pending_word != 0) {
                             const lz: u32 = @clz(pending_word);
                             const bit_id_in_word = bw.word_type_bits - 1 - lz;
                             pending_word ^= @as(Word, 1) << @truncate(bit_id_in_word);
-                            if (!visitPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
+                            if (!try visitPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
                         }
                     }
 
@@ -461,7 +461,7 @@ pub fn Layer(comptime wt: WordType) type {
                 /// - `word_id` - word index to scan.
                 ///
                 /// Return - false on early exit, true when the word completed.
-                pub inline fn step(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32) bool {
+                pub inline fn step(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32) anyerror!bool {
                     if (include_len == 0 and exclude_len == 0) return true;
                     if (on_inactive != null and on_active != null and on_mixed != null and on_deep_mixed != null) {
                         return stepFull(data, word_id);
@@ -476,7 +476,7 @@ pub fn Layer(comptime wt: WordType) type {
                 /// - `end_bit` - range edge or null for no upper limit.
                 ///
                 /// Return - false on early exit, true when the scan completed.
-                pub inline fn iterateAll(data: LayersWithContext(include_len, exclude_len, Context), start_bit: ?u32, end_bit: ?u32) bool {
+                pub inline fn iterateAll(data: LayersWithContext(include_len, exclude_len, Context), start_bit: ?u32, end_bit: ?u32) anyerror!bool {
                     if (include_len == 0 and exclude_len == 0) return true;
                     const first = if (include_len > 0) data.includes[0] else data.excludes[0];
                     if (first.activity.items.len == 0) return true;
@@ -489,7 +489,7 @@ pub fn Layer(comptime wt: WordType) type {
                         const w_base = bw.wordToBitId(@truncate(wid));
                         const s = @max(range.lo, w_base) - w_base;
                         const e = @min(range.hi, w_base + bw.word_type_bits) - w_base;
-                        if (!stepRange(data, @truncate(wid), s, e)) return false;
+                        if (!try stepRange(data, @truncate(wid), s, e)) return false;
                         if (wid == (if (direction == .forward) hi_word else lo_word)) break;
                         wid = if (direction == .forward) wid + 1 else wid - 1;
                     }
@@ -503,7 +503,7 @@ pub fn Layer(comptime wt: WordType) type {
                 /// - `sub_hi` - one past the last visited lane, exclusive.
                 ///
                 /// Return - false on early exit, true when the lanes completed.
-                inline fn stepRange(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32, sub_lo: u32, sub_hi: u32) bool {
+                inline fn stepRange(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32, sub_lo: u32, sub_hi: u32) anyerror!bool {
                     const context = data.context;
                     const start = bw.wordToBitId(word_id);
                     const range = rangeMask(sub_lo, sub_hi);
@@ -516,13 +516,13 @@ pub fn Layer(comptime wt: WordType) type {
                         if (direction == .forward) {
                             var i: u32 = sub_lo;
                             while (i < sub_hi) : (i += 1) {
-                                if (!visitCommonLane(context, start + i, inactive_mask, active_mask, mixed_mask, deep_mask, i)) return false;
+                                if (!try visitCommonLane(context, start + i, inactive_mask, active_mask, mixed_mask, deep_mask, i)) return false;
                             }
                         } else {
                             var i: u32 = sub_hi;
                             while (i > sub_lo) {
                                 i -= 1;
-                                if (!visitCommonLane(context, start + i, inactive_mask, active_mask, mixed_mask, deep_mask, i)) return false;
+                                if (!try visitCommonLane(context, start + i, inactive_mask, active_mask, mixed_mask, deep_mask, i)) return false;
                             }
                         }
                         return true;
@@ -538,14 +538,14 @@ pub fn Layer(comptime wt: WordType) type {
                         while (pending_word != 0) {
                             const bit_id_in_word: u32 = @ctz(pending_word);
                             pending_word &= pending_word - 1;
-                            if (!visitCommonPendingLane(context, start + bit_id_in_word, bit_id_in_word, inactive_mask, active_mask, mixed_mask, deep_mask)) return false;
+                            if (!try visitCommonPendingLane(context, start + bit_id_in_word, bit_id_in_word, inactive_mask, active_mask, mixed_mask, deep_mask)) return false;
                         }
                     } else {
                         while (pending_word != 0) {
                             const lz: u32 = @clz(pending_word);
                             const bit_id_in_word = bw.word_type_bits - 1 - lz;
                             pending_word ^= @as(Word, 1) << @truncate(bit_id_in_word);
-                            if (!visitCommonPendingLane(context, start + bit_id_in_word, bit_id_in_word, inactive_mask, active_mask, mixed_mask, deep_mask)) return false;
+                            if (!try visitCommonPendingLane(context, start + bit_id_in_word, bit_id_in_word, inactive_mask, active_mask, mixed_mask, deep_mask)) return false;
                         }
                     }
                     return true;
@@ -561,22 +561,22 @@ pub fn Layer(comptime wt: WordType) type {
                 /// - `i` - lane index inside the word.
                 ///
                 /// Return - false on early exit, true to continue.
-                inline fn visitCommonLane(context: Context, bit_id: u32, inactive_mask: Word, active_mask: Word, mixed_mask: Word, deep_mask: Word, i: u32) bool {
+                inline fn visitCommonLane(context: Context, bit_id: u32, inactive_mask: Word, active_mask: Word, mixed_mask: Word, deep_mask: Word, i: u32) anyerror!bool {
                     if (((inactive_mask >> @truncate(i)) & 1) != 0) {
                         if (on_inactive) |f| {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                         }
                     } else if (((active_mask >> @truncate(i)) & 1) != 0) {
                         if (on_active) |f| {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                         }
                     } else if (((mixed_mask >> @truncate(i)) & 1) != 0) {
                         if (on_mixed) |f| {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                         }
                     } else if (((deep_mask >> @truncate(i)) & 1) != 0) {
                         if (on_deep_mixed) |f| {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                         }
                     }
                     return true;
@@ -592,29 +592,29 @@ pub fn Layer(comptime wt: WordType) type {
                 /// - `deep_mask` - merged deeply mixed lanes.
                 ///
                 /// Return - false on early exit, true to continue.
-                inline fn visitCommonPendingLane(context: Context, bit_id: u32, bit_id_in_word: u32, inactive_mask: Word, active_mask: Word, mixed_mask: Word, deep_mask: Word) bool {
+                inline fn visitCommonPendingLane(context: Context, bit_id: u32, bit_id_in_word: u32, inactive_mask: Word, active_mask: Word, mixed_mask: Word, deep_mask: Word) anyerror!bool {
                     const bit: Word = @as(Word, 1) << @truncate(bit_id_in_word);
                     if (on_inactive) |f| {
                         if ((inactive_mask & bit) != 0) {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                             return true;
                         }
                     }
                     if (on_active) |f| {
                         if ((active_mask & bit) != 0) {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                             return true;
                         }
                     }
                     if (on_mixed) |f| {
                         if ((mixed_mask & bit) != 0) {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                             return true;
                         }
                     }
                     if (on_deep_mixed) |f| {
                         if ((deep_mask & bit) != 0) {
-                            if (!f(context, bit_id)) return false;
+                            if (!try f(context, bit_id)) return false;
                             return true;
                         }
                     }
@@ -640,7 +640,7 @@ pub fn Layer(comptime wt: WordType) type {
                 /// - `word_id` - word index to scan.
                 ///
                 /// Return - false on early exit, true when the word completed.
-                inline fn stepFull(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32) bool {
+                inline fn stepFull(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32) anyerror!bool {
                     const first = if (include_len > 0) data.includes[0] else data.excludes[0];
                     const context = data.context;
                     std.debug.assert(word_id < first.activity.items.len);
@@ -658,13 +658,13 @@ pub fn Layer(comptime wt: WordType) type {
                     if (direction == .forward) {
                         var i: u32 = 0;
                         while (i < bound) : (i += 1) {
-                            if (!visitCommonLane(context, start + i, inactive_mask, active_mask, mixed_mask, deep_mask, i)) return false;
+                            if (!try visitCommonLane(context, start + i, inactive_mask, active_mask, mixed_mask, deep_mask, i)) return false;
                         }
                     } else {
                         var i: u32 = bound;
                         while (i > 0) {
                             i -= 1;
-                            if (!visitCommonLane(context, start + i, inactive_mask, active_mask, mixed_mask, deep_mask, i)) return false;
+                            if (!try visitCommonLane(context, start + i, inactive_mask, active_mask, mixed_mask, deep_mask, i)) return false;
                         }
                     }
                     return true;
@@ -676,7 +676,7 @@ pub fn Layer(comptime wt: WordType) type {
                 /// - `word_id` - word index to scan.
                 ///
                 /// Return - false on early exit, true when the word completed.
-                inline fn stepPending(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32) bool {
+                inline fn stepPending(data: LayersWithContext(include_len, exclude_len, Context), word_id: u32) anyerror!bool {
                     const first = if (include_len > 0) data.includes[0] else data.excludes[0];
                     const context = data.context;
                     std.debug.assert(word_id < first.activity.items.len);
@@ -704,14 +704,14 @@ pub fn Layer(comptime wt: WordType) type {
                         while (pending_word != 0) {
                             const bit_id_in_word: u32 = @ctz(pending_word);
                             pending_word &= pending_word - 1;
-                            if (!visitCommonPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
+                            if (!try visitCommonPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
                         }
                     } else {
                         while (pending_word != 0) {
                             const lz: u32 = @clz(pending_word);
                             const bit_id_in_word = bw.word_type_bits - 1 - lz;
                             pending_word ^= @as(Word, 1) << @truncate(bit_id_in_word);
-                            if (!visitCommonPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
+                            if (!try visitCommonPendingLane(context, start + bit_id_in_word, bit_id_in_word, only_inactive_word, only_active_word, only_mixed_word, only_deep_mixed)) return false;
                         }
                     }
 
@@ -1226,35 +1226,35 @@ const StepStates = struct {
     }
 };
 
-inline fn stepPushI(ctx: *StepStates, bit_id: u32) bool {
+inline fn stepPushI(ctx: *StepStates, bit_id: u32) anyerror!bool {
     ctx.inactive[ctx.ni] = bit_id;
     ctx.ni += 1;
     return ctx.total() < ctx.stop_after;
 }
 
-inline fn stepPushA(ctx: *StepStates, bit_id: u32) bool {
+inline fn stepPushA(ctx: *StepStates, bit_id: u32) anyerror!bool {
     ctx.active[ctx.na] = bit_id;
     ctx.na += 1;
     return ctx.total() < ctx.stop_after;
 }
 
-fn stepPushM(ctx: *StepStates, bit_id: u32) bool {
+fn stepPushM(ctx: *StepStates, bit_id: u32) anyerror!bool {
     ctx.mixed[ctx.nm] = bit_id;
     ctx.nm += 1;
     return ctx.total() < ctx.stop_after;
 }
 
-inline fn stepPushD(ctx: *StepStates, bit_id: u32) bool {
+inline fn stepPushD(ctx: *StepStates, bit_id: u32) anyerror!bool {
     ctx.deep[ctx.nd] = bit_id;
     ctx.nd += 1;
     return ctx.total() < ctx.stop_after;
 }
 
-fn stepCollectAll(comptime wt: WordType, layer: *Layer(wt), ctx: *StepStates) bool {
+fn stepCollectAll(comptime wt: WordType, layer: *Layer(wt), ctx: *StepStates) anyerror!bool {
     const It = Layer(wt).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
     var wid: u32 = 0;
     while (wid < layer.activity.items.len) : (wid += 1) {
-        if (!It.step(.{ .layer = layer, .context = ctx }, wid)) return false;
+        if (!try It.step(.{ .layer = layer, .context = ctx }, wid)) return false;
     }
     return true;
 }
@@ -1324,7 +1324,7 @@ fn stepCheckOne(comptime wt: WordType, n: u32, pat: StepPattern) !void {
     }
 
     var ctx = StepStates{};
-    try t.expect(stepCollectAll(wt, &layer, &ctx));
+    try t.expect(try stepCollectAll(wt, &layer, &ctx));
 
     var exp: [4][256]u32 = undefined;
     const ns = stepOracleStates(wt, &layer, &exp);
@@ -1360,7 +1360,7 @@ test "Layer step: early exit stops the walk" {
         try layer.resize(t.allocator, 70, .inactive);
         const It = Layer(.u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 3 };
-        try t.expect(!It.step(.{ .layer = &layer, .context = &ctx }, 0));
+        try t.expect(!try It.step(.{ .layer = &layer, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 3), ctx.ni);
         try t.expectEqual(@as(usize, 0), ctx.na + ctx.nm + ctx.nd);
         try t.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, ctx.inactive[0..ctx.ni]);
@@ -1375,7 +1375,7 @@ test "Layer step: early exit stops the walk" {
         const It = Layer(.u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 10 };
 
-        try t.expect(!It.step(.{ .layer = &layer, .context = &ctx }, 0));
+        try t.expect(!try It.step(.{ .layer = &layer, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 8), ctx.ni);
         try t.expectEqualSlices(u32, &[_]u32{ 0, 9 }, ctx.active[0..ctx.na]);
     }
@@ -1386,9 +1386,9 @@ test "Layer step: early exit stops the walk" {
         try layer.resize(t.allocator, 130, .deep_mixed);
         const It = Layer(.u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 70 };
-        try t.expect(It.step(.{ .layer = &layer, .context = &ctx }, 0));
+        try t.expect(try It.step(.{ .layer = &layer, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 64), ctx.nd);
-        try t.expect(!It.step(.{ .layer = &layer, .context = &ctx }, 1));
+        try t.expect(!try It.step(.{ .layer = &layer, .context = &ctx }, 1));
         try t.expectEqual(@as(usize, 70), ctx.nd);
         try t.expectEqual(@as(u32, 64), ctx.deep[64]);
         try t.expectEqual(@as(u32, 69), ctx.deep[69]);
@@ -1400,7 +1400,7 @@ test "Layer step: early exit stops the walk" {
         try layer.resize(t.allocator, 10, .mixed);
         const It = Layer(.u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 1 };
-        try t.expect(!It.step(.{ .layer = &layer, .context = &ctx }, 0));
+        try t.expect(!try It.step(.{ .layer = &layer, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 1), ctx.ni + ctx.na + ctx.nm + ctx.nd);
     }
 }
@@ -1412,28 +1412,28 @@ const CommonOrderStates = struct {
     stop_after: u32 = std.math.maxInt(u32),
 };
 
-inline fn commonOrderPushI(ctx: *CommonOrderStates, bit_id: u32) bool {
+inline fn commonOrderPushI(ctx: *CommonOrderStates, bit_id: u32) anyerror!bool {
     ctx.ids[ctx.n] = bit_id;
     ctx.tags[ctx.n] = 0;
     ctx.n += 1;
     return ctx.n < ctx.stop_after;
 }
 
-inline fn commonOrderPushA(ctx: *CommonOrderStates, bit_id: u32) bool {
+inline fn commonOrderPushA(ctx: *CommonOrderStates, bit_id: u32) anyerror!bool {
     ctx.ids[ctx.n] = bit_id;
     ctx.tags[ctx.n] = 1;
     ctx.n += 1;
     return ctx.n < ctx.stop_after;
 }
 
-fn commonOrderPushM(ctx: *CommonOrderStates, bit_id: u32) bool {
+fn commonOrderPushM(ctx: *CommonOrderStates, bit_id: u32) anyerror!bool {
     ctx.ids[ctx.n] = bit_id;
     ctx.tags[ctx.n] = 2;
     ctx.n += 1;
     return ctx.n < ctx.stop_after;
 }
 
-inline fn commonOrderPushD(ctx: *CommonOrderStates, bit_id: u32) bool {
+inline fn commonOrderPushD(ctx: *CommonOrderStates, bit_id: u32) anyerror!bool {
     ctx.ids[ctx.n] = bit_id;
     ctx.tags[ctx.n] = 3;
     ctx.n += 1;
@@ -1451,13 +1451,13 @@ fn commonStepCollect(
     includes: [IL]*Layer(wt),
     excludes: [EL]*Layer(wt),
     ctx: *StepStates,
-) bool {
+) anyerror!bool {
     const It = Layer(wt).CommonIterator(IL, EL, *StepStates, on_i, on_a, on_m, on_d, .forward);
     if (IL == 0 and EL == 0) return true;
     const words_len = if (IL > 0) includes[0].activity.items.len else excludes[0].activity.items.len;
     var wid: u32 = 0;
     while (wid < words_len) : (wid += 1) {
-        if (!It.step(.{ .includes = includes, .excludes = excludes, .context = ctx }, wid)) return false;
+        if (!try It.step(.{ .includes = includes, .excludes = excludes, .context = ctx }, wid)) return false;
     }
     return true;
 }
@@ -1469,13 +1469,13 @@ fn commonStepCollectOrder(
     includes: [IL]*Layer(wt),
     excludes: [EL]*Layer(wt),
     ctx: *CommonOrderStates,
-) bool {
+) anyerror!bool {
     const It = Layer(wt).CommonIterator(IL, EL, *CommonOrderStates, commonOrderPushI, commonOrderPushA, commonOrderPushM, commonOrderPushD, .forward);
     if (IL == 0 and EL == 0) return true;
     const words_len = if (IL > 0) includes[0].activity.items.len else excludes[0].activity.items.len;
     var wid: u32 = 0;
     while (wid < words_len) : (wid += 1) {
-        if (!It.step(.{ .includes = includes, .excludes = excludes, .context = ctx }, wid)) return false;
+        if (!try It.step(.{ .includes = includes, .excludes = excludes, .context = ctx }, wid)) return false;
     }
     return true;
 }
@@ -1597,7 +1597,7 @@ fn commonCheckOne(
 
     {
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(wt, IL, EL, stepPushI, stepPushA, stepPushM, stepPushD, inc_ptrs, exc_ptrs, &ctx));
+        try t.expect(try commonStepCollect(wt, IL, EL, stepPushI, stepPushA, stepPushM, stepPushD, inc_ptrs, exc_ptrs, &ctx));
         try t.expectEqualSlices(u32, exp[0][0..ns[0]], ctx.inactive[0..ctx.ni]);
         try t.expectEqualSlices(u32, exp[1][0..ns[1]], ctx.active[0..ctx.na]);
         try t.expectEqualSlices(u32, exp[2][0..ns[2]], ctx.mixed[0..ctx.nm]);
@@ -1605,38 +1605,38 @@ fn commonCheckOne(
     }
     {
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(wt, IL, EL, stepPushI, null, null, null, inc_ptrs, exc_ptrs, &ctx));
+        try t.expect(try commonStepCollect(wt, IL, EL, stepPushI, null, null, null, inc_ptrs, exc_ptrs, &ctx));
         try t.expectEqualSlices(u32, exp[0][0..ns[0]], ctx.inactive[0..ctx.ni]);
         try t.expectEqual(@as(usize, 0), ctx.na + ctx.nm + ctx.nd);
     }
     {
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(wt, IL, EL, null, stepPushA, null, null, inc_ptrs, exc_ptrs, &ctx));
+        try t.expect(try commonStepCollect(wt, IL, EL, null, stepPushA, null, null, inc_ptrs, exc_ptrs, &ctx));
         try t.expectEqualSlices(u32, exp[1][0..ns[1]], ctx.active[0..ctx.na]);
         try t.expectEqual(@as(usize, 0), ctx.ni + ctx.nm + ctx.nd);
     }
     {
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(wt, IL, EL, null, null, stepPushM, null, inc_ptrs, exc_ptrs, &ctx));
+        try t.expect(try commonStepCollect(wt, IL, EL, null, null, stepPushM, null, inc_ptrs, exc_ptrs, &ctx));
         try t.expectEqualSlices(u32, exp[2][0..ns[2]], ctx.mixed[0..ctx.nm]);
         try t.expectEqual(@as(usize, 0), ctx.ni + ctx.na + ctx.nd);
     }
     {
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(wt, IL, EL, null, null, null, stepPushD, inc_ptrs, exc_ptrs, &ctx));
+        try t.expect(try commonStepCollect(wt, IL, EL, null, null, null, stepPushD, inc_ptrs, exc_ptrs, &ctx));
         try t.expectEqualSlices(u32, exp[3][0..ns[3]], ctx.deep[0..ctx.nd]);
         try t.expectEqual(@as(usize, 0), ctx.ni + ctx.na + ctx.nm);
     }
     {
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(wt, IL, EL, stepPushI, stepPushA, null, null, inc_ptrs, exc_ptrs, &ctx));
+        try t.expect(try commonStepCollect(wt, IL, EL, stepPushI, stepPushA, null, null, inc_ptrs, exc_ptrs, &ctx));
         try t.expectEqualSlices(u32, exp[0][0..ns[0]], ctx.inactive[0..ctx.ni]);
         try t.expectEqualSlices(u32, exp[1][0..ns[1]], ctx.active[0..ctx.na]);
         try t.expectEqual(@as(usize, 0), ctx.nm + ctx.nd);
     }
     {
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(wt, IL, EL, null, null, stepPushM, stepPushD, inc_ptrs, exc_ptrs, &ctx));
+        try t.expect(try commonStepCollect(wt, IL, EL, null, null, stepPushM, stepPushD, inc_ptrs, exc_ptrs, &ctx));
         try t.expectEqualSlices(u32, exp[2][0..ns[2]], ctx.mixed[0..ctx.nm]);
         try t.expectEqualSlices(u32, exp[3][0..ns[3]], ctx.deep[0..ctx.nd]);
         try t.expectEqual(@as(usize, 0), ctx.ni + ctx.na);
@@ -1686,7 +1686,7 @@ fn commonCheckOrder(
     const ns = commonOracleStates(wt, IL, EL, inc_ptrs, exc_ptrs, n, &exp);
 
     var ctx = CommonOrderStates{};
-    try t.expect(commonStepCollectOrder(wt, IL, EL, inc_ptrs, exc_ptrs, &ctx));
+    try t.expect(try commonStepCollectOrder(wt, IL, EL, inc_ptrs, exc_ptrs, &ctx));
 
     var taken = [4]usize{ 0, 0, 0, 0 };
     var prev: u32 = 0;
@@ -1722,7 +1722,7 @@ test "Layer CommonIterator: spec poles 1+1" {
 
     const It = Layer(.u8).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
     var ctx = StepStates{};
-    try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
+    try t.expect(try It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
     try t.expectEqualSlices(u32, &[_]u32{0}, ctx.inactive[0..ctx.ni]);
     try t.expectEqualSlices(u32, &[_]u32{1}, ctx.active[0..ctx.na]);
     try t.expectEqualSlices(u32, &[_]u32{ 2, 3 }, ctx.mixed[0..ctx.nm]);
@@ -1743,7 +1743,7 @@ test "Layer CommonIterator: 1+1 truth table" {
             layerSetState(.u8, &exc, 0, se);
             const It = Layer(.u8).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
             var ctx = StepStates{};
-            try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
+            try t.expect(try It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
             const si_nt = si == .mixed or si == .deep_mixed;
             const se_nt = se == .mixed or se == .deep_mixed;
             if (si_nt or se_nt) {
@@ -1782,7 +1782,7 @@ fn commonCheckSingleMatchesIterator(comptime wt: WordType, n: u32, pat: StepPatt
     const ns = stepOracleStates(wt, &layer, &exp);
 
     var got = StepStates{};
-    try t.expect(commonStepCollect(wt, 1, 0, stepPushI, stepPushA, stepPushM, stepPushD, .{&layer}, .{}, &got));
+    try t.expect(try commonStepCollect(wt, 1, 0, stepPushI, stepPushA, stepPushM, stepPushD, .{&layer}, .{}, &got));
     const lists = [_][]const u32{
         got.inactive[0..got.ni],
         got.active[0..got.na],
@@ -1795,7 +1795,7 @@ fn commonCheckSingleMatchesIterator(comptime wt: WordType, n: u32, pat: StepPatt
     var wid: u32 = 0;
     const It = Layer(wt).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
     while (wid < layer.activity.items.len) : (wid += 1) {
-        if (!It.step(.{ .layer = &layer, .context = &ref }, wid)) break;
+        if (!try It.step(.{ .layer = &layer, .context = &ref }, wid)) break;
     }
     try t.expectEqualSlices(u32, ref.inactive[0..ref.ni], got.inactive[0..got.ni]);
     try t.expectEqualSlices(u32, ref.active[0..ref.na], got.active[0..got.na]);
@@ -1828,7 +1828,7 @@ fn commonCheckSwappedDual(comptime wt: WordType, n: u32, pat: StepPattern) !void
     const ns = stepOracleStates(wt, &layer, &exp);
 
     var got = StepStates{};
-    try t.expect(commonStepCollect(wt, 0, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{}, .{&layer}, &got));
+    try t.expect(try commonStepCollect(wt, 0, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{}, .{&layer}, &got));
     try t.expectEqualSlices(u32, exp[1][0..ns[1]], got.inactive[0..got.ni]);
     try t.expectEqualSlices(u32, exp[0][0..ns[0]], got.active[0..got.na]);
     try t.expectEqualSlices(u32, exp[2][0..ns[2]], got.mixed[0..got.nm]);
@@ -1860,7 +1860,7 @@ test "Layer CommonIterator: all uniform and aliasing" {
             layerSetState(.u64, &exc, i, @enumFromInt(@intFromEnum(patternState(pat, i))));
         }
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
+        try t.expect(try commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
         switch (pat) {
             .all_inactive, .all_active => try t.expectEqual(@as(usize, 0), ctx.total()),
             .all_mixed => {
@@ -1882,7 +1882,7 @@ test "Layer CommonIterator: all uniform and aliasing" {
         try inc.resize(t.allocator, 70, .active);
         try exc.resize(t.allocator, 70, .inactive);
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
+        try t.expect(try commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
         try t.expectEqual(@as(usize, 70), ctx.na);
         try t.expectEqual(@as(usize, 0), ctx.ni + ctx.nm + ctx.nd);
     }
@@ -1894,7 +1894,7 @@ test "Layer CommonIterator: all uniform and aliasing" {
         try inc.resize(t.allocator, 70, .inactive);
         try exc.resize(t.allocator, 70, .active);
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
+        try t.expect(try commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
         try t.expectEqual(@as(usize, 70), ctx.ni);
         try t.expectEqual(@as(usize, 0), ctx.na + ctx.nm + ctx.nd);
     }
@@ -2054,7 +2054,7 @@ test "Layer CommonIterator: fuzz vs oracle u64 2+2" {
         var exp: [4][256]u32 = undefined;
         const ns = commonOracleStates(.u64, 2, 2, .{ &inc_sets[0], &inc_sets[1] }, .{ &exc_sets[0], &exc_sets[1] }, n, &exp);
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(.u64, 2, 2, stepPushI, stepPushA, stepPushM, stepPushD, .{ &inc_sets[0], &inc_sets[1] }, .{ &exc_sets[0], &exc_sets[1] }, &ctx));
+        try t.expect(try commonStepCollect(.u64, 2, 2, stepPushI, stepPushA, stepPushM, stepPushD, .{ &inc_sets[0], &inc_sets[1] }, .{ &exc_sets[0], &exc_sets[1] }, &ctx));
         try t.expectEqualSlices(u32, exp[0][0..ns[0]], ctx.inactive[0..ctx.ni]);
         try t.expectEqualSlices(u32, exp[1][0..ns[1]], ctx.active[0..ctx.na]);
         try t.expectEqualSlices(u32, exp[2][0..ns[2]], ctx.mixed[0..ctx.nm]);
@@ -2109,7 +2109,7 @@ test "Layer CommonIterator: fuzz vs oracle u8 3+3" {
         var exp: [4][256]u32 = undefined;
         const ns = commonOracleStates(.u8, 3, 3, .{ &inc_sets[0], &inc_sets[1], &inc_sets[2] }, .{ &exc_sets[0], &exc_sets[1], &exc_sets[2] }, n, &exp);
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(.u8, 3, 3, stepPushI, stepPushA, stepPushM, stepPushD, .{ &inc_sets[0], &inc_sets[1], &inc_sets[2] }, .{ &exc_sets[0], &exc_sets[1], &exc_sets[2] }, &ctx));
+        try t.expect(try commonStepCollect(.u8, 3, 3, stepPushI, stepPushA, stepPushM, stepPushD, .{ &inc_sets[0], &inc_sets[1], &inc_sets[2] }, .{ &exc_sets[0], &exc_sets[1], &exc_sets[2] }, &ctx));
         try t.expectEqualSlices(u32, exp[0][0..ns[0]], ctx.inactive[0..ctx.ni]);
         try t.expectEqualSlices(u32, exp[1][0..ns[1]], ctx.active[0..ctx.na]);
         try t.expectEqualSlices(u32, exp[2][0..ns[2]], ctx.mixed[0..ctx.nm]);
@@ -2129,7 +2129,7 @@ test "Layer CommonIterator: null side is skipped" {
         layerSetState(.u64, &inc, 69, .active);
         layerSetState(.u64, &exc, 69, .active);
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(.u64, 1, 1, null, stepPushA, null, null, .{&inc}, .{&exc}, &ctx));
+        try t.expect(try commonStepCollect(.u64, 1, 1, null, stepPushA, null, null, .{&inc}, .{&exc}, &ctx));
         try t.expectEqualSlices(u32, &[_]u32{5}, ctx.active[0..ctx.na]);
         try t.expectEqual(@as(usize, 0), ctx.ni + ctx.nm + ctx.nd);
     }
@@ -2142,7 +2142,7 @@ test "Layer CommonIterator: null side is skipped" {
         try exc.resize(t.allocator, 10, .inactive);
         layerSetState(.u8, &exc, 3, .active);
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(.u8, 1, 1, stepPushI, null, null, null, .{&inc}, .{&exc}, &ctx));
+        try t.expect(try commonStepCollect(.u8, 1, 1, stepPushI, null, null, null, .{&inc}, .{&exc}, &ctx));
         try t.expectEqualSlices(u32, &[_]u32{3}, ctx.inactive[0..ctx.ni]);
         try t.expectEqual(@as(usize, 0), ctx.na + ctx.nm + ctx.nd);
     }
@@ -2154,7 +2154,7 @@ test "Layer CommonIterator: null side is skipped" {
         try inc.resize(t.allocator, 10, .mixed);
         try exc.resize(t.allocator, 10, .mixed);
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(.u64, 1, 1, null, null, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
+        try t.expect(try commonStepCollect(.u64, 1, 1, null, null, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
         try t.expectEqual(@as(usize, 0), ctx.ni + ctx.na);
         try t.expectEqual(@as(usize, 10), ctx.nm);
         try t.expectEqual(@as(usize, 0), ctx.nd);
@@ -2171,7 +2171,7 @@ test "Layer CommonIterator: early exit stops the walk" {
         try exc.resize(t.allocator, 70, .active);
         const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 3 };
-        try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
+        try t.expect(!try It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 3), ctx.ni);
         try t.expectEqual(@as(usize, 0), ctx.na + ctx.nm + ctx.nd);
         try t.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, ctx.inactive[0..ctx.ni]);
@@ -2188,7 +2188,7 @@ test "Layer CommonIterator: early exit stops the walk" {
         layerSetState(.u64, &exc, 0, .inactive);
         const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 4 };
-        try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
+        try t.expect(!try It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqualSlices(u32, &[_]u32{0}, ctx.active[0..ctx.na]);
         try t.expectEqualSlices(u32, &[_]u32{ 1, 2, 3 }, ctx.inactive[0..ctx.ni]);
     }
@@ -2201,9 +2201,9 @@ test "Layer CommonIterator: early exit stops the walk" {
         try exc.resize(t.allocator, 130, .deep_mixed);
         const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 70 };
-        try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
+        try t.expect(try It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 64), ctx.nd);
-        try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 1));
+        try t.expect(!try It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 1));
         try t.expectEqual(@as(usize, 70), ctx.nd);
         try t.expectEqual(@as(u32, 64), ctx.deep[64]);
         try t.expectEqual(@as(u32, 69), ctx.deep[69]);
@@ -2217,7 +2217,7 @@ test "Layer CommonIterator: early exit stops the walk" {
         try exc.resize(t.allocator, 10, .deep_mixed);
         const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 1 };
-        try t.expect(!It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
+        try t.expect(!try It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 1), ctx.total());
         try t.expectEqual(@as(u32, 0), ctx.mixed[0]);
     }
@@ -2230,11 +2230,11 @@ test "Layer CommonIterator: early exit stops the walk" {
         try exc.resize(t.allocator, 10, .inactive);
         const It = Layer(.u64).CommonIterator(1, 1, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{ .stop_after = 50 };
-        try t.expect(It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
+        try t.expect(try It.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 10), ctx.na);
         var only_d = StepStates{ .stop_after = 1 };
         const ItD = Layer(.u64).CommonIterator(1, 1, *StepStates, null, null, null, stepPushD, .forward);
-        try t.expect(ItD.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &only_d }, 0));
+        try t.expect(try ItD.step(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &only_d }, 0));
         try t.expectEqual(@as(usize, 0), only_d.total());
     }
 }
@@ -2250,13 +2250,13 @@ test "Layer CommonIterator: empty sets and zero lens" {
         defer exc0.deinit(t.allocator);
         defer exc1.deinit(t.allocator);
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(.u64, 2, 2, stepPushI, stepPushA, stepPushM, stepPushD, .{ &inc0, &inc1 }, .{ &exc0, &exc1 }, &ctx));
+        try t.expect(try commonStepCollect(.u64, 2, 2, stepPushI, stepPushA, stepPushM, stepPushD, .{ &inc0, &inc1 }, .{ &exc0, &exc1 }, &ctx));
         try t.expectEqual(@as(usize, 0), ctx.total());
     }
     {
         const It00 = Layer(.u64).CommonIterator(0, 0, *StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .forward);
         var ctx = StepStates{};
-        try t.expect(It00.step(.{ .includes = .{}, .excludes = .{}, .context = &ctx }, 0));
+        try t.expect(try It00.step(.{ .includes = .{}, .excludes = .{}, .context = &ctx }, 0));
         try t.expectEqual(@as(usize, 0), ctx.total());
     }
     {
@@ -2265,7 +2265,7 @@ test "Layer CommonIterator: empty sets and zero lens" {
         try exc.resize(t.allocator, 10, .inactive);
         layerSetState(.u8, &exc, 5, .active);
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(.u8, 0, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{}, .{&exc}, &ctx));
+        try t.expect(try commonStepCollect(.u8, 0, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{}, .{&exc}, &ctx));
         try t.expectEqual(@as(usize, 9), ctx.na);
         try t.expectEqualSlices(u32, &[_]u32{5}, ctx.inactive[0..ctx.ni]);
         for (ctx.active[0..ctx.na]) |id| try t.expect(id != 5);
@@ -2276,7 +2276,7 @@ test "Layer CommonIterator: empty sets and zero lens" {
         try inc.resize(t.allocator, 10, .inactive);
         layerSetState(.u8, &inc, 3, .active);
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(.u8, 1, 0, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{}, &ctx));
+        try t.expect(try commonStepCollect(.u8, 1, 0, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{}, &ctx));
         try t.expectEqualSlices(u32, &[_]u32{3}, ctx.active[0..ctx.na]);
         try t.expectEqual(@as(usize, 9), ctx.ni);
         for (ctx.inactive[0..ctx.ni]) |id| try t.expect(id != 3);
@@ -2299,7 +2299,7 @@ test "Layer CommonIterator: tail bound never leaks padding" {
         exc.activity.items[exc.activity.items.len - 1] |= ~valid;
         exc.mixed.items[exc.mixed.items.len - 1] |= ~valid;
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
+        try t.expect(try commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
         try t.expectEqual(n, @as(u32, @intCast(ctx.na)));
         try t.expectEqual(@as(usize, 0), ctx.ni + ctx.nm + ctx.nd);
         try t.expectEqual(@as(u32, n - 1), ctx.active[ctx.na - 1]);
@@ -2318,7 +2318,7 @@ test "Layer CommonIterator: tail bound never leaks padding" {
         exc.activity.items[exc.activity.items.len - 1] |= ~valid;
         exc.mixed.items[exc.mixed.items.len - 1] |= ~valid;
         var ctx = StepStates{};
-        try t.expect(commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
+        try t.expect(try commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
         try t.expectEqual(@as(usize, 0), ctx.na + ctx.nm + ctx.nd);
         try t.expectEqual(@as(u32, 65), @as(u32, @intCast(ctx.ni)));
         try t.expectEqual(@as(u32, 64), ctx.inactive[ctx.ni - 1]);
@@ -2425,8 +2425,8 @@ fn rangeCheckLayer(comptime wt: WordType, n: u32, lo: ?u32, hi: ?u32) !void {
     const ItB = L.Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD, .backward);
     var fwd = StepStates{};
     var bwd = StepStates{};
-    try t.expect(ItF.iterateAll(.{ .layer = &layer, .context = &fwd }, lo, hi));
-    try t.expect(ItB.iterateAll(.{ .layer = &layer, .context = &bwd }, lo, hi));
+    try t.expect(try ItF.iterateAll(.{ .layer = &layer, .context = &fwd }, lo, hi));
+    try t.expect(try ItB.iterateAll(.{ .layer = &layer, .context = &bwd }, lo, hi));
     const got_f = [_][]const u32{
         fwd.inactive[0..fwd.ni],
         fwd.active[0..fwd.na],
@@ -2507,11 +2507,100 @@ test "Layer CommonIterator iterateAll: ranges vs oracle" {
         const ItB = Layer(.u64).CommonIterator(1, 1, *StepStates, null, stepPushA, null, null, .backward);
         var fwd = StepStates{};
         var bwd = StepStates{};
-        try t.expect(ItF.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &fwd }, b[0], b[1]));
-        try t.expect(ItB.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &bwd }, b[0], b[1]));
+        try t.expect(try ItF.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &fwd }, b[0], b[1]));
+        try t.expect(try ItB.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &bwd }, b[0], b[1]));
         try t.expectEqualSlices(u32, exp[0..n_exp], fwd.active[0..fwd.na]);
         var rev: [256]u32 = undefined;
         for (0..n_exp) |j| rev[j] = exp[n_exp - 1 - j];
         try t.expectEqualSlices(u32, rev[0..n_exp], bwd.active[0..bwd.na]);
     }
+}
+
+const ErrStates = struct {
+    calls: u32 = 0,
+    fail_at: u32 = std.math.maxInt(u32),
+};
+
+inline fn errPushI(ctx: *ErrStates, bit_id: u32) anyerror!bool {
+    _ = bit_id;
+    ctx.calls += 1;
+    if (ctx.calls == ctx.fail_at) return error.CallbackFailed;
+    return true;
+}
+
+inline fn errPushA(ctx: *ErrStates, bit_id: u32) anyerror!bool {
+    _ = bit_id;
+    ctx.calls += 1;
+    if (ctx.calls == ctx.fail_at) return error.CallbackFailed;
+    return true;
+}
+
+fn errPushM(ctx: *ErrStates, bit_id: u32) anyerror!bool {
+    _ = bit_id;
+    ctx.calls += 1;
+    if (ctx.calls == ctx.fail_at) return error.CallbackFailed;
+    return true;
+}
+
+inline fn errPushD(ctx: *ErrStates, bit_id: u32) anyerror!bool {
+    _ = bit_id;
+    ctx.calls += 1;
+    if (ctx.calls == ctx.fail_at) return error.CallbackFailed;
+    return true;
+}
+
+test "Layer fallible: user error propagates from every state lane" {
+    var layer: Layer(.u64) = .{};
+    defer layer.deinit(t.allocator);
+    try layer.resize(t.allocator, 130, .inactive);
+    var i: u32 = 0;
+    while (i < 130) : (i += 1) {
+        layerSetState(.u64, &layer, i, @enumFromInt(@as(u2, @truncate(i))));
+    }
+
+    // Non-inline mixed lane fails through step and iterateAll.
+    {
+        const It = Layer(.u64).Iterator(*ErrStates, null, null, errPushM, null, .forward);
+        var ctx = ErrStates{ .fail_at = 2 };
+        try t.expectError(error.CallbackFailed, It.step(.{ .layer = &layer, .context = &ctx }, 0));
+        try t.expectEqual(@as(u32, 2), ctx.calls);
+        var ctx_all = ErrStates{ .fail_at = 4 };
+        try t.expectError(error.CallbackFailed, It.iterateAll(.{ .layer = &layer, .context = &ctx_all }, null, null));
+        try t.expectEqual(@as(u32, 4), ctx_all.calls);
+    }
+    // Inline lanes fail the same way when all four callbacks are installed.
+    {
+        const It = Layer(.u64).Iterator(*ErrStates, errPushI, errPushA, errPushM, errPushD, .forward);
+        var ctx = ErrStates{ .fail_at = 9 };
+        try t.expectError(error.CallbackFailed, It.iterateAll(.{ .layer = &layer, .context = &ctx }, null, null));
+        try t.expectEqual(@as(u32, 9), ctx.calls);
+    }
+    // No failure: full walk completes with true.
+    {
+        const It = Layer(.u64).Iterator(*ErrStates, errPushI, errPushA, errPushM, errPushD, .forward);
+        var ctx = ErrStates{};
+        try t.expect(try It.iterateAll(.{ .layer = &layer, .context = &ctx }, null, null));
+        try t.expectEqual(@as(u32, 130), ctx.calls);
+    }
+    // Backward walk aborts the same way (reverse peel path).
+    {
+        const It = Layer(.u64).Iterator(*ErrStates, errPushI, errPushA, errPushM, errPushD, .backward);
+        var ctx = ErrStates{ .fail_at = 9 };
+        try t.expectError(error.CallbackFailed, It.iterateAll(.{ .layer = &layer, .context = &ctx }, null, null));
+        try t.expectEqual(@as(u32, 9), ctx.calls);
+    }
+}
+
+test "Layer CommonIterator fallible: user error propagates" {
+    var inc: Layer(.u64) = .{};
+    defer inc.deinit(t.allocator);
+    var exc: Layer(.u64) = .{};
+    defer exc.deinit(t.allocator);
+    try inc.resize(t.allocator, 130, .active);
+    try exc.resize(t.allocator, 130, .inactive);
+
+    const It = Layer(.u64).CommonIterator(1, 1, *ErrStates, errPushI, errPushA, errPushM, errPushD, .forward);
+    var ctx = ErrStates{ .fail_at = 6 };
+    try t.expectError(error.CallbackFailed, It.iterateAll(.{ .includes = .{&inc}, .excludes = .{&exc}, .context = &ctx }, null, null));
+    try t.expectEqual(@as(u32, 6), ctx.calls);
 }

@@ -150,7 +150,7 @@ const SumCtx = struct {
     /// - `id` - visited bit id.
     ///
     /// Return - always true to continue the scan.
-    inline fn addInline(self: *SumCtx, id: u32) bool {
+    inline fn addInline(self: *SumCtx, id: u32) anyerror!bool {
         std.mem.doNotOptimizeAway(id);
         self.sum += id;
         self.count += 1;
@@ -165,7 +165,7 @@ const SumCtx = struct {
 /// - `reps` - timed repetitions.
 ///
 /// Return - pinned sums, counts and total nanoseconds.
-fn benchTree(io: std.Io, tree: *Tree, comptime want: BitState, reps: u32) struct { sum: u64, count: u64, ns: u64 } {
+fn benchTree(io: std.Io, tree: *Tree, comptime want: BitState, reps: u32) !struct { sum: u64, count: u64, ns: u64 } {
     const It = Tree.Iterator(*SumCtx, SumCtx.addInline, null, .forward);
     const ItI = Tree.Iterator(*SumCtx, null, SumCtx.addInline, .forward);
     const use_flat = if (want == .active) It.predictsFlat(tree) else ItI.predictsFlat(tree);
@@ -178,9 +178,9 @@ fn benchTree(io: std.Io, tree: *Tree, comptime want: BitState, reps: u32) struct
         while (r < reps) : (r += 1) {
             var c = SumCtx{};
             const done = if (want == .active)
-                It.iterateFlat(.{ .tree = tree, .context = &c }, null, null)
+                try It.iterateFlat(.{ .tree = tree, .context = &c }, null, null)
             else
-                ItI.iterateFlat(.{ .tree = tree, .context = &c }, null, null);
+                try ItI.iterateFlat(.{ .tree = tree, .context = &c }, null, null);
             std.mem.doNotOptimizeAway(done);
             sum += c.sum;
             count += c.count;
@@ -190,9 +190,9 @@ fn benchTree(io: std.Io, tree: *Tree, comptime want: BitState, reps: u32) struct
         while (r < reps) : (r += 1) {
             var c = SumCtx{};
             const done = if (want == .active)
-                It.iterateTree(.{ .tree = tree, .context = &c }, null, null)
+                try It.iterateTree(.{ .tree = tree, .context = &c }, null, null)
             else
-                ItI.iterateTree(.{ .tree = tree, .context = &c }, null, null);
+                try ItI.iterateTree(.{ .tree = tree, .context = &c }, null, null);
             std.mem.doNotOptimizeAway(done);
             sum += c.sum;
             count += c.count;
@@ -224,7 +224,7 @@ const VerifyCtx = struct {
     /// - `id` - visited bit id.
     ///
     /// Return - always true to continue the scan.
-    inline fn push(ctx: *VerifyCtx, id: u32) bool {
+    inline fn push(ctx: *VerifyCtx, id: u32) anyerror!bool {
         ctx.list.appendAssumeCapacity(id);
         return true;
     }
@@ -273,9 +273,9 @@ fn verifyTree(
         const It = Tree.Iterator(*VerifyCtx, VerifyCtx.push, null, .forward);
         const ItI = Tree.Iterator(*VerifyCtx, null, VerifyCtx.push, .forward);
         if (want == .active) {
-            _ = It.iterateAll(.{ .tree = tree, .context = &vc }, null, null);
+            _ = try It.iterateAll(.{ .tree = tree, .context = &vc }, null, null);
         } else {
-            _ = ItI.iterateAll(.{ .tree = tree, .context = &vc }, null, null);
+            _ = try ItI.iterateAll(.{ .tree = tree, .context = &vc }, null, null);
         }
     }
     if (got.items.len != exp.items.len) {
@@ -322,13 +322,13 @@ fn benchOne(
         const It = Tree.Iterator(*SumCtx, SumCtx.addInline, null, .forward);
         const ItI = Tree.Iterator(*SumCtx, null, SumCtx.addInline, .forward);
         const done = if (want == .active)
-            It.iterateAll(.{ .tree = tree, .context = &c }, null, null)
+            try It.iterateAll(.{ .tree = tree, .context = &c }, null, null)
         else
-            ItI.iterateAll(.{ .tree = tree, .context = &c }, null, null);
+            try ItI.iterateAll(.{ .tree = tree, .context = &c }, null, null);
         std.mem.doNotOptimizeAway(done);
     }
     const exp = oracleSumOnce(oracle, want);
-    const got = benchTree(io, tree, want, reps);
+    const got = try benchTree(io, tree, want, reps);
     std.debug.assert(exp.sum * reps == got.sum and exp.count * reps == got.count);
     const ms: f64 = @as(f64, @floatFromInt(got.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0;
     try rows.append(alloc, .{ .name = try alloc.dupe(u8, name), .elements = exp.count, .ms = ms, .flat = bit_tree.last_predict_used_flat });
@@ -464,14 +464,14 @@ const CommonCtx = struct {
     /// Appends one active id without reallocation checks in hot code.
     ///
     /// Return - always true to continue the scan.
-    inline fn pushA(ctx: *CommonCtx, id: u32) bool {
+    inline fn pushA(ctx: *CommonCtx, id: u32) anyerror!bool {
         ctx.active.appendAssumeCapacity(id);
         return true;
     }
     /// Appends one inactive id without reallocation checks in hot code.
     ///
     /// Return - always true to continue the scan.
-    inline fn pushI(ctx: *CommonCtx, id: u32) bool {
+    inline fn pushI(ctx: *CommonCtx, id: u32) anyerror!bool {
         ctx.inactive.appendAssumeCapacity(id);
         return true;
     }
@@ -534,7 +534,7 @@ fn verifyCommon(
     try vc.inactive.ensureTotalCapacity(alloc, exp_i.items.len);
     {
         const It = Tree.CommonIterator(IL, EL, *CommonCtx, CommonCtx.pushA, CommonCtx.pushI, .forward);
-        _ = It.iterateAll(.{
+        _ = try It.iterateAll(.{
             .includes = includes,
             .excludes = excludes,
             .context = &vc,
@@ -569,7 +569,7 @@ fn timeCommonArm(
     excludes: [EL]*Tree,
     ctx: *CommonCtx,
     arm: u32,
-) u64 {
+) !u64 {
     const on_a = if (mode == .inactive_only) null else CommonCtx.pushA;
     const on_i = if (mode == .active_only) null else CommonCtx.pushI;
     const It = Tree.CommonIterator(IL, EL, *CommonCtx, on_a, on_i, .forward);
@@ -578,11 +578,11 @@ fn timeCommonArm(
     ctx.inactive.clearRetainingCapacity();
     var watch = Stopwatch.start(io);
     if (arm == 0) {
-        _ = It.iterateFlat(data, null, null);
+        _ = try It.iterateFlat(data, null, null);
     } else if (arm == 1) {
-        _ = It.iterateTree(data, null, null);
+        _ = try It.iterateTree(data, null, null);
     } else {
-        _ = It.iterateAll(data, null, null);
+        _ = try It.iterateAll(data, null, null);
     }
     const ns = watch.read();
     std.mem.doNotOptimizeAway(ctx.active.items.len + ctx.inactive.items.len);
@@ -638,9 +638,9 @@ fn benchCommonMode(
     var ms: [3]f64 = undefined;
     var a: usize = 0;
     while (a < 3) : (a += 1) {
-        _ = timeCommonArm(IL, EL, mode, io, includes, excludes, &lists, @truncate(a));
+        _ = try timeCommonArm(IL, EL, mode, io, includes, excludes, &lists, @truncate(a));
         var samples: [7]u64 = undefined;
-        for (0..7) |r| samples[r] = timeCommonArm(IL, EL, mode, io, includes, excludes, &lists, @truncate(a));
+        for (0..7) |r| samples[r] = try timeCommonArm(IL, EL, mode, io, includes, excludes, &lists, @truncate(a));
         ms[a] = @as(f64, @floatFromInt(medianNs(&samples))) / 1_000_000.0;
     }
     const choice_flat = It.predictsFlat(includes, excludes);
