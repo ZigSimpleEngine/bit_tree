@@ -6,7 +6,7 @@ pub const Options = struct {
     /// The target architecture for which the module will be built.
     target: ?std.Build.ResolvedTarget = null,
     /// The optimization mode used to compile the module.
-    optimize: ?std.builtin.OptimizeMode = null,
+    optimize: ?std.lang.Optimize = null,
 
     pub fn initFromOptions(b: *std.Build) Options {
         return .{
@@ -90,7 +90,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_bench_bit_tree = b.addRunArtifact(bench_bit_tree_exe);
-    if (b.args) |args| run_bench_bit_tree.addArgs(args);
+    run_bench_bit_tree.addPassthruArgs();
 
     const bench_bit_tree_step = b.step("bench_bit_tree", "Run tree benchmarks with history");
     bench_bit_tree_step.dependOn(&run_bench_bit_tree.step);

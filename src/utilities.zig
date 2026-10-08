@@ -145,7 +145,7 @@ pub const BitState = enum(u1) {
     ///
     /// Return - word with all bits cleared or all bits set.
     pub inline fn toWordState(self: Self, comptime wt: WordType) wt.Type() {
-        return 0 -% @as(wt.Type(), @intFromEnum(self));
+        return 0 -% @as(wt.Type(), @backingInt(self));
     }
 
     /// Converts the state into a plain boolean for branch conditions.

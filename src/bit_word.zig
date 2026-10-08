@@ -216,7 +216,7 @@ pub fn BitWord(comptime wt: WordType) type {
         ///
         /// Return - decoded bit state.
         pub inline fn readBitState(word: Word, bit_id_in_word: Shift) BitState {
-            return @enumFromInt(@as(u1, @truncate(word >> bit_id_in_word)));
+            return @fromBackingInt(@intCast(@as(u1, @truncate(word >> bit_id_in_word))));
         }
 
         /// Reads one raw bit as u1 for arithmetic fast paths.

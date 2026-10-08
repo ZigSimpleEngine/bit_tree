@@ -78,9 +78,9 @@ pub fn Layer(comptime wt: WordType) type {
             ///
             /// Return - decoded summary state.
             pub inline fn fromBitsState(activity: BitState, mixed: BitState) State {
-                const b0: u2 = @intFromEnum(activity);
-                const b1: u2 = @as(u2, @intFromEnum(mixed)) << 1;
-                return @enumFromInt(b0 | b1);
+                const b0: u2 = @backingInt(activity);
+                const b1: u2 = @as(u2, @backingInt(mixed)) << 1;
+                return @fromBackingInt(@intCast(b0 | b1));
             }
 
             /// Extracts the activity lane of a summary state.
@@ -88,8 +88,8 @@ pub fn Layer(comptime wt: WordType) type {
             ///
             /// Return - logical activity value.
             pub inline fn activityBit(self: State) BitState {
-                const b0: u1 = @truncate(@as(u2, @intFromEnum(self)));
-                return @enumFromInt(b0);
+                const b0: u1 = @truncate(@as(u2, @backingInt(self)));
+                return @fromBackingInt(@intCast(b0));
             }
 
             /// Extracts the mixed lane of a summary state.
@@ -97,8 +97,8 @@ pub fn Layer(comptime wt: WordType) type {
             ///
             /// Return - logical mixed value.
             pub inline fn mixedBit(self: State) BitState {
-                const b0: u1 = @truncate(@as(u2, @intFromEnum(self)) >> 1);
-                return @enumFromInt(b0);
+                const b0: u1 = @truncate(@as(u2, @backingInt(self)) >> 1);
+                return @fromBackingInt(@intCast(b0));
             }
         };
 
@@ -881,8 +881,8 @@ pub fn Layer(comptime wt: WordType) type {
             } else {
                 self.mixed.items[word_id] = old_m & ~bit;
             }
-            self.state_counters[@intFromEnum(old_value)] -= 1;
-            self.state_counters[@intFromEnum(value)] += 1;
+            self.state_counters[@backingInt(old_value)] -= 1;
+            self.state_counters[@backingInt(value)] += 1;
         }
 
         /// Grows or shrinks both planes while keeping counters exact.
@@ -943,7 +943,7 @@ pub fn Layer(comptime wt: WordType) type {
                     mix[new_words_count - 1] &= new_valid;
                 }
 
-                self.state_counters[@intFromEnum(created_bits_value)] += new_bits_count - old_bits_count;
+                self.state_counters[@backingInt(created_bits_value)] += new_bits_count - old_bits_count;
                 self.bits_count = new_bits_count;
             } else {
                 const act_old = self.activity.items;
@@ -1026,7 +1026,7 @@ fn scanCounters(comptime wt: WordType, layer: *const Layer(wt)) [4]u32 {
         const bit_id_in_word = BW.bitIdInWord(i);
         const a = BW.readBitState(layer.activity.items[bit_word_id], @truncate(bit_id_in_word));
         const m = BW.readBitState(layer.mixed.items[bit_word_id], @truncate(bit_id_in_word));
-        out[@intFromEnum(Layer(wt).State.fromBitsState(a, m))] += 1;
+        out[@backingInt(Layer(wt).State.fromBitsState(a, m))] += 1;
     }
     return out;
 }
@@ -1052,19 +1052,19 @@ fn expectLayerValid(comptime wt: WordType, layer: *const Layer(wt)) !void {
 
 test "Layer.State int constants match enum values" {
     const S = Layer(.u64).State;
-    try t.expectEqual(S.inactive_u2, @intFromEnum(S.inactive));
-    try t.expectEqual(S.active_u2, @intFromEnum(S.active));
-    try t.expectEqual(S.mixed_u2, @intFromEnum(S.mixed));
-    try t.expectEqual(S.deep_mixed_u2, @intFromEnum(S.deep_mixed));
-    try t.expectEqual(S.inactive_u32, @intFromEnum(S.inactive));
-    try t.expectEqual(S.active_u32, @intFromEnum(S.active));
-    try t.expectEqual(S.mixed_u32, @intFromEnum(S.mixed));
-    try t.expectEqual(S.deep_mixed_u32, @intFromEnum(S.deep_mixed));
+    try t.expectEqual(S.inactive_u2, @backingInt(S.inactive));
+    try t.expectEqual(S.active_u2, @backingInt(S.active));
+    try t.expectEqual(S.mixed_u2, @backingInt(S.mixed));
+    try t.expectEqual(S.deep_mixed_u2, @backingInt(S.deep_mixed));
+    try t.expectEqual(S.inactive_u32, @backingInt(S.inactive));
+    try t.expectEqual(S.active_u32, @backingInt(S.active));
+    try t.expectEqual(S.mixed_u32, @backingInt(S.mixed));
+    try t.expectEqual(S.deep_mixed_u32, @backingInt(S.deep_mixed));
     comptime {
-        if (S.inactive_u2 != @intFromEnum(S.inactive)) @compileError("inactive const mismatch");
-        if (S.active_u2 != @intFromEnum(S.active)) @compileError("active const mismatch");
-        if (S.mixed_u2 != @intFromEnum(S.mixed)) @compileError("mixed const mismatch");
-        if (S.deep_mixed_u2 != @intFromEnum(S.deep_mixed)) @compileError("deep_mixed const mismatch");
+        if (S.inactive_u2 != @backingInt(S.inactive)) @compileError("inactive const mismatch");
+        if (S.active_u2 != @backingInt(S.active)) @compileError("active const mismatch");
+        if (S.mixed_u2 != @backingInt(S.mixed)) @compileError("mixed const mismatch");
+        if (S.deep_mixed_u2 != @backingInt(S.deep_mixed)) @compileError("deep_mixed const mismatch");
     }
 }
 
@@ -1268,7 +1268,7 @@ fn stepOracleStates(comptime wt: WordType, layer: *const Layer(wt), out: *[4][25
         const in_w = BW.bitIdInWord(i);
         const a = BW.readBitState(layer.activity.items[wid], in_w);
         const m = BW.readBitState(layer.mixed.items[wid], in_w);
-        const s: usize = @intFromEnum(Layer(wt).State.fromBitsState(a, m));
+        const s: usize = @backingInt(Layer(wt).State.fromBitsState(a, m));
         out[s][ns[s]] = i;
         ns[s] += 1;
     }
@@ -1283,9 +1283,9 @@ fn patternState(pat: StepPattern, i: u32) Layer(.u64).State {
         .all_active => .active,
         .all_mixed => .mixed,
         .all_deep => .deep_mixed,
-        .cycle4 => @enumFromInt(@as(u2, @truncate(i))),
+        .cycle4 => @fromBackingInt(@intCast(@as(u2, @truncate(i)))),
         .sparse_deep => if (i == 0 or i % 63 == 0) .deep_mixed else .inactive,
-        .pseudo => @enumFromInt(@as(u2, @truncate((i *% 2654435761) >> 29))),
+        .pseudo => @fromBackingInt(@intCast(@as(u2, @truncate((i *% 2654435761) >> 29)))),
     };
 }
 
@@ -1309,7 +1309,7 @@ fn stepCheckOne(comptime wt: WordType, n: u32, pat: StepPattern) !void {
     var i: u32 = 0;
     while (i < n) : (i += 1) {
         const st64 = patternState(pat, i);
-        layerSetState(wt, &layer, i, @enumFromInt(@intFromEnum(st64)));
+        layerSetState(wt, &layer, i, @fromBackingInt(@intCast(@backingInt(st64))));
     }
     try expectLayerValid(wt, &layer);
 
@@ -1571,7 +1571,7 @@ fn commonCheckOne(
         try inc_sets[k].resize(t.allocator, n, .inactive);
         var i: u32 = 0;
         while (i < n) : (i += 1) {
-            layerSetState(wt, &inc_sets[k], i, @enumFromInt(@intFromEnum(patternState(pats_inc[k], i))));
+            layerSetState(wt, &inc_sets[k], i, @fromBackingInt(@intCast(@backingInt(patternState(pats_inc[k], i)))));
         }
     }
     for (0..EL) |k| {
@@ -1579,7 +1579,7 @@ fn commonCheckOne(
         try exc_sets[k].resize(t.allocator, n, .inactive);
         var i: u32 = 0;
         while (i < n) : (i += 1) {
-            layerSetState(wt, &exc_sets[k], i, @enumFromInt(@intFromEnum(patternState(pats_exc[k], i))));
+            layerSetState(wt, &exc_sets[k], i, @fromBackingInt(@intCast(@backingInt(patternState(pats_exc[k], i)))));
         }
     }
     defer {
@@ -1661,7 +1661,7 @@ fn commonCheckOrder(
         try inc_sets[k].resize(t.allocator, n, .inactive);
         var i: u32 = 0;
         while (i < n) : (i += 1) {
-            layerSetState(wt, &inc_sets[k], i, @enumFromInt(@intFromEnum(patternState(pats_inc[k], i))));
+            layerSetState(wt, &inc_sets[k], i, @fromBackingInt(@intCast(@backingInt(patternState(pats_inc[k], i)))));
         }
     }
     for (0..EL) |k| {
@@ -1669,7 +1669,7 @@ fn commonCheckOrder(
         try exc_sets[k].resize(t.allocator, n, .inactive);
         var i: u32 = 0;
         while (i < n) : (i += 1) {
-            layerSetState(wt, &exc_sets[k], i, @enumFromInt(@intFromEnum(patternState(pats_exc[k], i))));
+            layerSetState(wt, &exc_sets[k], i, @fromBackingInt(@intCast(@backingInt(patternState(pats_exc[k], i)))));
         }
     }
     defer {
@@ -1774,7 +1774,7 @@ fn commonCheckSingleMatchesIterator(comptime wt: WordType, n: u32, pat: StepPatt
     try layer.resize(t.allocator, n, .inactive);
     var i: u32 = 0;
     while (i < n) : (i += 1) {
-        layerSetState(wt, &layer, i, @enumFromInt(@intFromEnum(patternState(pat, i))));
+        layerSetState(wt, &layer, i, @fromBackingInt(@intCast(@backingInt(patternState(pat, i)))));
     }
     commonPoisonPadding(wt, 1, 0, .{&layer}, .{}, n);
 
@@ -1820,7 +1820,7 @@ fn commonCheckSwappedDual(comptime wt: WordType, n: u32, pat: StepPattern) !void
     try layer.resize(t.allocator, n, .inactive);
     var i: u32 = 0;
     while (i < n) : (i += 1) {
-        layerSetState(wt, &layer, i, @enumFromInt(@intFromEnum(patternState(pat, i))));
+        layerSetState(wt, &layer, i, @fromBackingInt(@intCast(@backingInt(patternState(pat, i)))));
     }
     commonPoisonPadding(wt, 0, 1, .{}, .{&layer}, n);
 
@@ -1856,8 +1856,8 @@ test "Layer CommonIterator: all uniform and aliasing" {
         try exc.resize(t.allocator, 70, .inactive);
         var i: u32 = 0;
         while (i < 70) : (i += 1) {
-            layerSetState(.u64, &inc, i, @enumFromInt(@intFromEnum(patternState(pat, i))));
-            layerSetState(.u64, &exc, i, @enumFromInt(@intFromEnum(patternState(pat, i))));
+            layerSetState(.u64, &inc, i, @fromBackingInt(@intCast(@backingInt(patternState(pat, i)))));
+            layerSetState(.u64, &exc, i, @fromBackingInt(@intCast(@backingInt(patternState(pat, i)))));
         }
         var ctx = StepStates{};
         try t.expect(try commonStepCollect(.u64, 1, 1, stepPushI, stepPushA, stepPushM, stepPushD, .{&inc}, .{&exc}, &ctx));
@@ -2404,7 +2404,7 @@ fn rangeCheckLayer(comptime wt: WordType, n: u32, lo: ?u32, hi: ?u32) !void {
     try layer.resize(t.allocator, n, .inactive);
     var i: u32 = 0;
     while (i < n) : (i += 1) {
-        layerSetState(wt, &layer, i, @enumFromInt(@as(u2, @truncate((i *% 2654435761) >> 29))));
+        layerSetState(wt, &layer, i, @fromBackingInt(@intCast(@as(u2, @truncate((i *% 2654435761) >> 29)))));
     }
 
     const r_lo: u32 = @min(lo orelse 0, hi orelse n);
@@ -2416,7 +2416,7 @@ fn rangeCheckLayer(comptime wt: WordType, n: u32, lo: ?u32, hi: ?u32) !void {
     var ns = [4]usize{ 0, 0, 0, 0 };
     var k: u32 = c_lo;
     while (k < c_hi) : (k += 1) {
-        const s: usize = @intFromEnum(layer.getBit(k));
+        const s: usize = @backingInt(layer.getBit(k));
         exp[s][ns[s]] = k;
         ns[s] += 1;
     }
@@ -2555,7 +2555,7 @@ test "Layer fallible: user error propagates from every state lane" {
     try layer.resize(t.allocator, 130, .inactive);
     var i: u32 = 0;
     while (i < 130) : (i += 1) {
-        layerSetState(.u64, &layer, i, @enumFromInt(@as(u2, @truncate(i))));
+        layerSetState(.u64, &layer, i, @fromBackingInt(@intCast(@as(u2, @truncate(i)))));
     }
 
     // Non-inline mixed lane fails through step and iterateAll.

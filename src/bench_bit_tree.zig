@@ -911,7 +911,7 @@ fn benchCommonBuilt(
     n: u32,
     fill: fn ([]*Tree, u32, Allocator, u32) anyerror!void,
 ) !CommonBenchResult {
-    var trees: [IL + EL]Tree = [_]Tree{.{}} ** (IL + EL);
+    var trees: [IL + EL]Tree = @splat(.{});
     defer {
         for (0..IL + EL) |k| trees[k].deinit(alloc);
     }

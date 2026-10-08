@@ -60,7 +60,7 @@ pub var predict_table: [4]PredictConfig = .{
 ///
 /// Return - mutable pointer to the width-specific config.
 fn predictRow(wt: WordType) *PredictConfig {
-    return &predict_table[@intFromEnum(wt)];
+    return &predict_table[@backingInt(wt)];
 }
 
 /// Records the last auto choice for benchmarks and tests.
@@ -1187,7 +1187,7 @@ fn expectTreeCoherent(comptime wt: WordType, tree: *const BitTree(wt)) !void {
             const in_w = BW.bitIdInWord(i);
             const a = BW.readBitState(layer.activity.items[w2], in_w);
             const m = BW.readBitState(layer.mixed.items[w2], in_w);
-            scanned[@intFromEnum(L.State.fromBitsState(a, m))] += 1;
+            scanned[@backingInt(L.State.fromBitsState(a, m))] += 1;
         }
         try t.expectEqualSlices(u32, &scanned, &layer.state_counters);
     }
@@ -1250,7 +1250,7 @@ test "BitTree step: early exit" {
         var ctx = TreeStepIds{ .stop_after = 3 };
         _ = try It.iterateAll(.{ .tree = &tree, .context = &ctx }, null, null);
         try t.expectEqual(@as(usize, 3), ctx.na + ctx.ni);
-        var seen: [70]bool = [_]bool{false} ** 70;
+        var seen: [70]bool = @splat(false);
         for (ctx.active[0..ctx.na]) |id| {
             try t.expect(id < 70);
             try t.expect(!seen[id]);
@@ -1271,7 +1271,7 @@ test "BitTree step: early exit" {
         var ctx = TreeStepIds{ .stop_after = 65 };
         _ = try It.iterateAll(.{ .tree = &tree, .context = &ctx }, null, null);
         try t.expectEqual(@as(usize, 65), ctx.na + ctx.ni);
-        var seen: [130]bool = [_]bool{false} ** 130;
+        var seen: [130]bool = @splat(false);
         for (ctx.active[0..ctx.na]) |id| {
             try t.expect(id < 130);
             try t.expect(!seen[id]);

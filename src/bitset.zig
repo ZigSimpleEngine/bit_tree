@@ -1235,7 +1235,7 @@ test "Bitset resize explicit corner table u64" {
 test "Bitset(u64) resize sequential fuzz vs oracle" {
     var bs = Bitset(.u64){};
     defer bs.deinit(t.allocator);
-    var expected: [512]u1 = [_]u1{0} ** 512;
+    var expected: [512]u1 = @splat(0);
     var expected_len: u32 = 0;
     var expected_active: u32 = 0;
     var rng: u64 = 0x9E3779B97F4A7C15;
@@ -1248,7 +1248,7 @@ test "Bitset(u64) resize sequential fuzz vs oracle" {
         const created: BitState = if ((r2 & 1) == 1) .active else .inactive;
         if (new_len > expected_len) {
             for (expected_len..new_len) |i| {
-                expected[i] = @intFromEnum(created);
+                expected[i] = @backingInt(created);
                 if (created == .active) expected_active += 1;
             }
         } else if (new_len < expected_len) {
@@ -1264,7 +1264,7 @@ test "Bitset(u64) resize sequential fuzz vs oracle" {
         try t.expectEqual(expected_active, bs.active_bits_counter);
         for (0..expected_len) |idx| {
             const i: u32 = @intCast(idx);
-            const want: BitState = @enumFromInt(expected[idx]);
+            const want: BitState = @fromBackingInt(@intCast(expected[idx]));
             const wid: usize = @intCast(BW.bitToWordId(i));
             const got = BW.readBitState(bs.words.items[wid], BW.bitIdInWord(i));
             try t.expectEqual(want, got);
@@ -1276,7 +1276,7 @@ test "Bitset(u64) resize sequential fuzz vs oracle" {
 test "Bitset(u8) resize sequential fuzz vs oracle" {
     var bs = Bitset(.u8){};
     defer bs.deinit(t.allocator);
-    var expected: [64]u1 = [_]u1{0} ** 64;
+    var expected: [64]u1 = @splat(0);
     var expected_len: u32 = 0;
     var expected_active: u32 = 0;
     var rng: u64 = 0x123456789ABCDEF;
@@ -1289,7 +1289,7 @@ test "Bitset(u8) resize sequential fuzz vs oracle" {
         const created: BitState = if ((r2 & 1) == 1) .active else .inactive;
         if (new_len > expected_len) {
             for (expected_len..new_len) |i| {
-                expected[i] = @intFromEnum(created);
+                expected[i] = @backingInt(created);
                 if (created == .active) expected_active += 1;
             }
         } else if (new_len < expected_len) {
@@ -1305,7 +1305,7 @@ test "Bitset(u8) resize sequential fuzz vs oracle" {
         try t.expectEqual(expected_active, bs.active_bits_counter);
         for (0..expected_len) |idx| {
             const i: u32 = @intCast(idx);
-            const want: BitState = @enumFromInt(expected[idx]);
+            const want: BitState = @fromBackingInt(@intCast(expected[idx]));
             const wid: usize = @intCast(BW.bitToWordId(i));
             const got = BW.readBitState(bs.words.items[wid], BW.bitIdInWord(i));
             try t.expectEqual(want, got);
