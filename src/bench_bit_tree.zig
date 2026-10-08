@@ -1089,7 +1089,7 @@ fn saveHistory(io: std.Io, alloc: Allocator, rows: []const Row, hists: []const H
 /// Return - error on allocation, verification or I/O failure.
 pub fn main(init: std.process.Init) !void {
     const io: std.Io = init.io;
-    var gpa = std.heap.DebugAllocator(.{}){};
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const alloc: Allocator = gpa.allocator();
 
