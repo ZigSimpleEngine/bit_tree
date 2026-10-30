@@ -2,7 +2,6 @@ const std = @import("std");
 const math = std.math;
 const utilities = @import("utilities.zig");
 const BitState = utilities.BitState;
-const print = std.debug.print;
 
 /// Backing integer width shared by bitsets, layers and trees.
 pub const WordType = enum {
@@ -29,6 +28,14 @@ pub const WordType = enum {
     }
 };
 
+/// Selects which matching run start getRangePosition returns.
+pub const Direction = enum {
+    /// Lowest matching run start.
+    first_low_bit,
+    /// Highest matching run start.
+    first_high_bit,
+};
+
 /// Compile-time bit arithmetic kit for one word width.
 /// - `wt` - word width the generated helpers operate on.
 ///
@@ -45,15 +52,19 @@ pub fn BitWord(comptime wt: WordType) type {
         pub const word_type_bits: u32 = @bitSizeOf(Word);
         /// Shift that converts between bit and word ids.
         pub const shift_type_bits: u32 = math.log2_int(u32, word_type_bits);
-        pub const shift_log_type_bits: u32 = math.log2_int(u32, shift_type_bits);
+        /// Bit width needed to store a range-size logarithm.
+        pub const shift_log_type_bits: u32 = math.log2_int_ceil(u32, shift_type_bits);
         /// Narrow index type that always fits inside one word.
         pub const Shift = @Int(.unsigned, shift_type_bits);
+        /// Narrow index type for range-size logarithms.
         pub const ShiftLog = @Int(.unsigned, shift_log_type_bits);
         /// Largest valid intra-word index, used for remaining-bit math.
         pub const shift_max_value: Shift = word_type_bits - 1;
+        /// Largest valid range-size logarithm, used for aligned masks.
         pub const shift_log_max_value: ShiftLog = shift_type_bits - 1;
         /// Clears low word bits to round an id down to a word start.
         pub const word_mask_inverted: u32 = ~(word_type_bits - 1);
+        /// Precomputed aligned start masks indexed by range-size logarithm.
         pub const aligned_range_positions_masks = blk: {
             var result: [@as(usize, shift_log_max_value) + 1]Word = undefined;
 
@@ -242,7 +253,19 @@ pub fn BitWord(comptime wt: WordType) type {
             return @truncate(word >> bit_id_in_word);
         }
 
-        pub inline fn getRangePosition(word: Word, range_size_log: ShiftLog, comptime aligned: bool) ?Shift {
+        /// Finds the selected start of a run of set bits in a word.
+        /// - `word` - backing word to scan.
+        /// - `range_size_log` - base-2 length of the run to find.
+        /// - `direction` - choose the lowest or highest matching run start.
+        /// - `aligned` - require the run to start on a range boundary.
+        ///
+        /// Return - selected run start, or null when no matching run exists.
+        pub inline fn getRangePosition(
+            word: Word,
+            comptime range_size_log: ShiftLog,
+            comptime direction: Direction,
+            comptime aligned: bool,
+        ) ?Shift {
             var shifted_word = word;
             inline for (0..range_size_log) |i| {
                 shifted_word &= shifted_word >> (1 << i);
@@ -252,13 +275,24 @@ pub fn BitWord(comptime wt: WordType) type {
                 shifted_word &= aligned_range_positions_masks[range_size_log];
             }
 
-            const clz_full = @clz(shifted_word);
-            if (clz_full == word_type_bits) return null;
-
-            print("word: {b:0>16}, shifted_word: {b:0>16}\n", .{ word, shifted_word });
-            return shift_max_value - @as(Shift, @truncate(clz_full));
+            return switch (direction) {
+                .first_low_bit => blk: {
+                    const ctz_full = @ctz(shifted_word);
+                    if (ctz_full == word_type_bits) break :blk null;
+                    break :blk @as(Shift, @truncate(ctz_full));
+                },
+                .first_high_bit => blk: {
+                    const clz_full = @clz(shifted_word);
+                    if (clz_full == word_type_bits) break :blk null;
+                    break :blk shift_max_value - @as(Shift, @truncate(clz_full));
+                },
+            };
         }
 
+        /// Builds a mask of positions where an aligned run can start.
+        /// - `range_size_log` - base-2 length of the aligned run.
+        ///
+        /// Return - mask with one bit set per valid aligned start.
         pub fn alignedRangePositionsMask(comptime range_size_log: ShiftLog) Word {
             comptime var result: Word = 0;
             comptime {
@@ -276,30 +310,52 @@ pub fn BitWord(comptime wt: WordType) type {
 
 const t = std.testing;
 
-test "getRangePosition test" {
-    const bw = BitWord(.u16);
-    const in = [_]u16{
-        0b0001_1111_0000_0111,
-        0b0000_1111_1111_0111,
-        0b0000_0000_1111_0111,
-        0b1111_1111_0000_0000,
-        0b0101_0101_0101_0101,
-        0b0101_0111_0101_1101,
-        0b0101_0111_1111_1111,
+test "getRangePosition" {
+    const BW = BitWord(.u16);
+    const patterns = [_]u16{ 0x0000, 0xFFFF, 0x0FF7, 0x1F07 };
+    const n_values = [_]BW.ShiftLog{ 0, 2, 3 };
+    const expected_unaligned = [2][4][3]?BW.Shift{
+        .{
+            .{ null, null, null },
+            .{ 0, 0, 0 },
+            .{ 0, 4, 4 },
+            .{ 0, 8, null },
+        },
+        .{
+            .{ null, null, null },
+            .{ 15, 12, 8 },
+            .{ 11, 8, 4 },
+            .{ 12, 9, null },
+        },
+    };
+    const expected_aligned = [2][4][3]?BW.Shift{
+        .{
+            .{ null, null, null },
+            .{ 0, 0, 0 },
+            .{ 0, 4, null },
+            .{ 0, 8, null },
+        },
+        .{
+            .{ null, null, null },
+            .{ 15, 12, 8 },
+            .{ 11, 8, null },
+            .{ 12, 8, null },
+        },
     };
 
-    var shift_log_counter: bw.ShiftLog = 0;
-    while (true) {
-        print("Positions Mask: {b:0>16} \n", .{bw.aligned_range_positions_masks[shift_log_counter]});
-        if (shift_log_counter == bw.shift_log_max_value) break;
-        shift_log_counter += 1;
-    }
-    const n = 3;
-    for (in) |value| {
-        print(
-            "Position: {?}, at n: {}\n",
-            .{ bw.getRangePosition(value, n, true), n },
-        );
+    for (patterns, 0..) |word, i| {
+        inline for ([_]Direction{ .first_low_bit, .first_high_bit }, 0..) |direction, d| {
+            inline for (n_values, 0..) |n, j| {
+                try t.expectEqual(
+                    expected_unaligned[d][i][j],
+                    BW.getRangePosition(word, n, direction, false),
+                );
+                try t.expectEqual(
+                    expected_aligned[d][i][j],
+                    BW.getRangePosition(word, n, direction, true),
+                );
+            }
+        }
     }
 }
 
