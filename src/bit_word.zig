@@ -2,6 +2,7 @@ const std = @import("std");
 const math = std.math;
 const utilities = @import("utilities.zig");
 const BitState = utilities.BitState;
+const print = std.debug.print;
 
 /// Backing integer width shared by bitsets, layers and trees.
 pub const WordType = enum {
@@ -44,12 +45,25 @@ pub fn BitWord(comptime wt: WordType) type {
         pub const word_type_bits: u32 = @bitSizeOf(Word);
         /// Shift that converts between bit and word ids.
         pub const shift_type_bits: u32 = math.log2_int(u32, word_type_bits);
+        pub const shift_log_type_bits: u32 = math.log2_int(u32, shift_type_bits);
         /// Narrow index type that always fits inside one word.
         pub const Shift = @Int(.unsigned, shift_type_bits);
+        pub const ShiftLog = @Int(.unsigned, shift_log_type_bits);
         /// Largest valid intra-word index, used for remaining-bit math.
         pub const shift_max_value: Shift = word_type_bits - 1;
+        pub const shift_log_max_value: ShiftLog = shift_type_bits - 1;
         /// Clears low word bits to round an id down to a word start.
         pub const word_mask_inverted: u32 = ~(word_type_bits - 1);
+        pub const aligned_range_positions_masks = blk: {
+            var result: [@as(usize, shift_log_max_value) + 1]Word = undefined;
+
+            for (0..@as(usize, shift_log_max_value) + 1) |i| {
+                const shift_log: ShiftLog = @intCast(i);
+                result[i] = alignedRangePositionsMask(shift_log);
+            }
+
+            break :blk result;
+        };
 
         /// Converts a global bit id into its containing word id.
         /// - `bit_id` - global bit index.
@@ -227,11 +241,67 @@ pub fn BitWord(comptime wt: WordType) type {
         pub inline fn readBit(word: Word, bit_id_in_word: Shift) u1 {
             return @truncate(word >> bit_id_in_word);
         }
+
+        pub inline fn getRangePosition(word: Word, range_size_log: ShiftLog, comptime aligned: bool) ?Shift {
+            var shifted_word = word;
+            inline for (0..range_size_log) |i| {
+                shifted_word &= shifted_word >> (1 << i);
+            }
+
+            if (aligned) {
+                shifted_word &= aligned_range_positions_masks[range_size_log];
+            }
+
+            const clz_full = @clz(shifted_word);
+            if (clz_full == word_type_bits) return null;
+
+            print("word: {b:0>16}, shifted_word: {b:0>16}\n", .{ word, shifted_word });
+            return shift_max_value - @as(Shift, @truncate(clz_full));
+        }
+
+        pub fn alignedRangePositionsMask(comptime range_size_log: ShiftLog) Word {
+            comptime var result: Word = 0;
+            comptime {
+                const range = 1 << range_size_log;
+                var iteration = 0;
+                while (iteration < word_type_bits) : (iteration += range) {
+                    result |= @as(Word, 1) << iteration;
+                }
+            }
+
+            return result;
+        }
     };
 }
 
 const t = std.testing;
-const print = std.debug.print;
+
+test "getRangePosition test" {
+    const bw = BitWord(.u16);
+    const in = [_]u16{
+        0b0001_1111_0000_0111,
+        0b0000_1111_1111_0111,
+        0b0000_0000_1111_0111,
+        0b1111_1111_0000_0000,
+        0b0101_0101_0101_0101,
+        0b0101_0111_0101_1101,
+        0b0101_0111_1111_1111,
+    };
+
+    var shift_log_counter: bw.ShiftLog = 0;
+    while (true) {
+        print("Positions Mask: {b:0>16} \n", .{bw.aligned_range_positions_masks[shift_log_counter]});
+        if (shift_log_counter == bw.shift_log_max_value) break;
+        shift_log_counter += 1;
+    }
+    const n = 3;
+    for (in) |value| {
+        print(
+            "Position: {?}, at n: {}\n",
+            .{ bw.getRangePosition(value, n, true), n },
+        );
+    }
+}
 
 test "BitWord u64" {
     const BitWord64 = BitWord(.u64);
