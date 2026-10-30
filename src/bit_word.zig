@@ -262,13 +262,17 @@ pub fn BitWord(comptime wt: WordType) type {
         /// Return - selected run start, or null when no matching run exists.
         pub inline fn getRangePosition(
             word: Word,
-            comptime range_size_log: ShiftLog,
+            range_size_log: ShiftLog,
             comptime direction: Direction,
             comptime aligned: bool,
         ) ?Shift {
             var shifted_word = word;
-            inline for (0..range_size_log) |i| {
-                shifted_word &= shifted_word >> (1 << i);
+            const range_shift: math.Log2Int(u32) = @intCast(range_size_log);
+            const range_size: u32 = @as(u32, 1) << range_shift;
+            var distance: Shift = @intCast(range_size >> 1);
+
+            while (distance != 0) : (distance >>= 1) {
+                shifted_word &= shifted_word >> distance;
             }
 
             if (aligned) {
@@ -345,7 +349,7 @@ test "getRangePosition" {
 
     for (patterns, 0..) |word, i| {
         inline for ([_]Direction{ .first_low_bit, .first_high_bit }, 0..) |direction, d| {
-            inline for (n_values, 0..) |n, j| {
+            for (n_values, 0..) |n, j| {
                 try t.expectEqual(
                     expected_unaligned[d][i][j],
                     BW.getRangePosition(word, n, direction, false),
