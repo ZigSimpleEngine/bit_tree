@@ -16,6 +16,11 @@ const Tree = bit_tree.BitTree(.u64);
 const HISTORY_PATH = "bench_bit_tree_history.txt";
 /// Maximum history columns shown before old runs roll off.
 const MAX_PREV_COLS: usize = 8;
+/// Prediction calls per timing sample in the common benchmark.
+const PREDICT_BATCH: u32 = 1000;
+
+/// Multiplier applied to every benchmark buffer size from the CLI.
+var iterations_multiplier: u32 = 1;
 
 /// Monotonic timer that stamps benchmark intervals in nanoseconds.
 const Stopwatch = struct {
@@ -39,6 +44,17 @@ const Stopwatch = struct {
         return @intCast(std.Io.Timestamp.durationTo(self.t0, t1).nanoseconds);
     }
 };
+
+/// Scales one base bit count by the CLI multiplier.
+/// - `base` - unscaled buffer size in bits.
+///
+/// Return - scaled size, or an error when it overflows u32.
+fn scaledBits(base: u32) !u32 {
+    return std.math.mul(u32, base, iterations_multiplier) catch {
+        std.debug.print("error: iterations_multiplier {d} overflows base size {d}\n", .{ iterations_multiplier, base });
+        return error.BufferSizeOverflow;
+    };
+}
 
 /// Fills the oracle with a strided active pattern.
 /// - `oracle` - reference set to populate.
@@ -103,6 +119,9 @@ fn fillTreeClustered(tree: *Tree, run: u32, gap: u32) void {
 ///
 /// Return - slice of the buffer with the short name.
 fn fmtCount(buf: []u8, n: u32) ![]u8 {
+    if (n >= 1_000_000_000 and n % 1_000_000_000 == 0) {
+        return std.fmt.bufPrint(buf, "{d}G", .{n / 1_000_000_000});
+    }
     if (n >= 1_000_000 and n % 1_000_000 == 0) {
         return std.fmt.bufPrint(buf, "{d}M", .{n / 1_000_000});
     }
@@ -110,6 +129,60 @@ fn fmtCount(buf: []u8, n: u32) ![]u8 {
         return std.fmt.bufPrint(buf, "{d}K", .{n / 1_000});
     }
     return std.fmt.bufPrint(buf, "{d}", .{n});
+}
+
+/// Formats a bit count rounded to the nearest lowercase k/m/g unit.
+/// - `buf` - scratch buffer receiving the formatted count.
+/// - `n` - raw count to shorten.
+///
+/// Return - slice of the buffer with the short name.
+fn fmtShortCount(buf: []u8, n: u32) ![]u8 {
+    const v: u64 = n;
+    if (v >= 999_500_000) {
+        return std.fmt.bufPrint(buf, "{d}g", .{(v + 500_000_000) / 1_000_000_000});
+    }
+    if (v >= 999_500) {
+        return std.fmt.bufPrint(buf, "{d}m", .{(v + 500_000) / 1_000_000});
+    }
+    if (v >= 1_000) {
+        return std.fmt.bufPrint(buf, "{d}k", .{(v + 500) / 1_000});
+    }
+    return std.fmt.bufPrint(buf, "{d}", .{v});
+}
+
+/// Builds one common scenario label by substituting its scaled bit count.
+/// - `alloc` - owns the returned label.
+/// - `template` - label text containing a `{n}` placeholder.
+/// - `n` - scaled valid bits substituted for `{n}`.
+///
+/// Return - allocated scenario label.
+fn commonScenarioName(alloc: Allocator, template: []const u8, n: u32) ![]u8 {
+    const marker = "{n}";
+    const idx = std.mem.indexOf(u8, template, marker) orelse return alloc.dupe(u8, template);
+    var cnt_buf: [16]u8 = undefined;
+    const count = try fmtShortCount(&cnt_buf, n);
+    return std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ template[0..idx], count, template[idx + marker.len ..] });
+}
+
+/// Names a fixed classic scenario, or rebuilds it with a scaled size suffix.
+/// - `name_buf` - scratch buffer for the rebuilt label.
+/// - `nbuf` - scratch buffer for the formatted size.
+/// - `default` - label used when the multiplier is one.
+/// - `prefix` - label text before the size.
+/// - `suffix` - label text after the size.
+/// - `n` - scaled buffer size in bits.
+///
+/// Return - default or rebuilt label.
+fn classicLabel(
+    name_buf: []u8,
+    nbuf: []u8,
+    default: []const u8,
+    prefix: []const u8,
+    suffix: []const u8,
+    n: u32,
+) ![]const u8 {
+    if (iterations_multiplier == 1) return default;
+    return std.fmt.bufPrint(name_buf, "{s}{s}{s}", .{ prefix, try fmtCount(nbuf, n), suffix });
 }
 
 /// Computes reference sums by scanning oracle words once.
@@ -338,7 +411,7 @@ fn benchOne(
 /// - `io` - clock source for timing.
 /// - `alloc` - owns row names.
 /// - `rows` - table collecting results.
-/// - `bits_total` - total bits in both containers.
+/// - `bits_total` - base total bits in both containers before scaling.
 /// - `stride` - distance between active bits.
 /// - `reps` - timed repetitions.
 ///
@@ -351,12 +424,13 @@ fn benchThreshold(
     stride: u32,
     reps: u32,
 ) !void {
+    const n = try scaledBits(bits_total);
     var oracle = Oracle{};
     defer oracle.deinit(alloc);
     var tree = Tree{};
     defer tree.deinit(alloc);
-    try oracle.resize(alloc, bits_total, .inactive);
-    try tree.resize(alloc, bits_total, .inactive);
+    try oracle.resize(alloc, n, .inactive);
+    try tree.resize(alloc, n, .inactive);
     fillStride(&oracle, stride, 0);
     fillTreeStride(&tree, stride, 0);
     var name_buf: [64]u8 = undefined;
@@ -364,7 +438,7 @@ fn benchThreshold(
     var nbuf: [16]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "gap{s}-N{s}", .{
         try fmtCount(&sbuf, stride),
-        try fmtCount(&nbuf, bits_total),
+        try fmtCount(&nbuf, n),
     });
     try benchOne(io, alloc, rows, name, &oracle, &tree, .active, reps);
 }
@@ -373,7 +447,7 @@ fn benchThreshold(
 /// - `io` - clock source for timing.
 /// - `alloc` - owns row names.
 /// - `rows` - table collecting results.
-/// - `bits_total` - total bits in both containers.
+/// - `bits_total` - base total bits in both containers before scaling.
 /// - `run` - active bits per cluster.
 /// - `gap` - inactive bits between clusters.
 /// - `reps` - timed repetitions.
@@ -388,12 +462,13 @@ fn benchCluster(
     gap: u32,
     reps: u32,
 ) !void {
+    const n = try scaledBits(bits_total);
     var oracle = Oracle{};
     defer oracle.deinit(alloc);
     var tree = Tree{};
     defer tree.deinit(alloc);
-    try oracle.resize(alloc, bits_total, .inactive);
-    try tree.resize(alloc, bits_total, .inactive);
+    try oracle.resize(alloc, n, .inactive);
+    try tree.resize(alloc, n, .inactive);
     fillClustered(&oracle, run, gap, 0);
     fillTreeClustered(&tree, run, gap);
     var name_buf: [64]u8 = undefined;
@@ -403,7 +478,7 @@ fn benchCluster(
     const name = try std.fmt.bufPrint(&name_buf, "cluster-r{s}-g{s}-N{s}", .{
         try fmtCount(&rbuf, run),
         try fmtCount(&gbuf, gap),
-        try fmtCount(&nbuf, bits_total),
+        try fmtCount(&nbuf, n),
     });
     try benchOne(io, alloc, rows, name, &oracle, &tree, .active, reps);
 }
@@ -412,7 +487,7 @@ fn benchCluster(
 /// - `io` - clock source for timing.
 /// - `alloc` - owns temporary trees.
 /// - `rows` - table collecting results.
-/// - `bits_total` - tree size per repetition.
+/// - `bits_total` - base tree size per repetition before scaling.
 /// - `stride` - distance between inserted bits.
 /// - `offset` - first inserted position.
 /// - `reps` - timed repetitions.
@@ -427,14 +502,15 @@ fn benchFill(
     offset: u32,
     reps: u32,
 ) !void {
+    const n = try scaledBits(bits_total);
     var watch = Stopwatch.start(io);
     var check: u64 = 0;
     var r: u32 = 0;
     while (r < reps) : (r += 1) {
         var tree = Tree{};
-        try tree.resize(alloc, bits_total, .inactive);
+        try tree.resize(alloc, n, .inactive);
         var b: u32 = offset;
-        while (b < bits_total) : (b += stride) {
+        while (b < n) : (b += stride) {
             tree.setBit(b, .active);
         }
         check += tree.bitset.active_bits_counter;
@@ -447,7 +523,7 @@ fn benchFill(
     var nbuf: [16]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "fill-s{s}-N{s}", .{
         try fmtCount(&sbuf, stride),
-        try fmtCount(&nbuf, bits_total),
+        try fmtCount(&nbuf, n),
     });
     try rows.append(alloc, .{ .name = try alloc.dupe(u8, name), .elements = check / reps, .ms = ns / 1_000_000.0 });
 }
@@ -589,12 +665,52 @@ fn timeCommonArm(
     return ns;
 }
 
+/// Times only the auto prediction for one common scenario.
+/// - `io` - clock source for the interval.
+/// - `includes` - trees whose leaves are ANDed.
+/// - `excludes` - trees whose leaves are ORed.
+/// - `mode` - installed callback subset.
+/// - `reps` - prediction calls per sample.
+///
+/// Return - median milliseconds per predictsFlat call.
+fn timePredict(
+    comptime IL: u32,
+    comptime EL: u32,
+    comptime mode: CommonMode,
+    io: std.Io,
+    includes: [IL]*Tree,
+    excludes: [EL]*Tree,
+    reps: u32,
+) f64 {
+    const on_a = if (mode == .inactive_only) null else CommonCtx.pushA;
+    const on_i = if (mode == .active_only) null else CommonCtx.pushI;
+    const It = Tree.CommonIterator(IL, EL, *CommonCtx, on_a, on_i, .forward);
+    std.mem.doNotOptimizeAway(It.predictsFlat(includes, excludes));
+    var samples: [7]u64 = undefined;
+    for (&samples) |*sample| {
+        var watch = Stopwatch.start(io);
+        var acc: u64 = 0;
+        var r: u32 = 0;
+        while (r < reps) : (r += 1) {
+            const choice = It.predictsFlat(includes, excludes);
+            std.mem.doNotOptimizeAway(choice);
+            acc +%= @intFromBool(choice);
+        }
+        std.mem.doNotOptimizeAway(acc);
+        sample.* = watch.read();
+    }
+    const total_ns = @as(f64, @floatFromInt(medianNs(&samples)));
+    return total_ns / @as(f64, @floatFromInt(reps)) / 1_000_000.0;
+}
+
 /// One common scenario result for the flat/tree/auto table.
 const CommonBenchResult = struct {
-    /// Scenario label, static storage.
+    /// Allocated scenario label.
     name: []const u8,
     /// Milliseconds per repetition per arm.
     ms: [3]f64,
+    /// Median milliseconds per predictsFlat call.
+    predict_ms: f64,
     /// Auto choice, true for flat.
     choice_flat: bool,
     /// Faster arm, true for flat.
@@ -608,7 +724,7 @@ const CommonBenchResult = struct {
 /// Benchmarks flat/tree/auto arms of one common scenario with medians.
 /// - `io` - clock source for timing.
 /// - `alloc` - owns temporary id lists.
-/// - `name` - scenario label, static storage.
+/// - `name` - allocated scenario label, ownership transferred.
 /// - `includes` - trees whose leaves are ANDed.
 /// - `excludes` - trees whose leaves are ORed.
 /// - `n` - shared valid bits.
@@ -645,6 +761,7 @@ fn benchCommonMode(
     }
     const choice_flat = It.predictsFlat(includes, excludes);
     bit_tree.last_predict_used_flat = choice_flat;
+    const predict_ms = timePredict(IL, EL, mode, io, includes, excludes, PREDICT_BATCH);
     const faster_flat = ms[0] < ms[1];
     const lo = if (faster_flat) ms[0] else ms[1];
     const margin = if (lo > 0) @abs(ms[0] - ms[1]) / lo else 0;
@@ -652,6 +769,7 @@ fn benchCommonMode(
     return .{
         .name = name,
         .ms = ms,
+        .predict_ms = predict_ms,
         .choice_flat = choice_flat,
         .faster_flat = faster_flat,
         .tied = tied,
@@ -662,15 +780,16 @@ fn benchCommonMode(
 /// Prints one compact flat/tree/auto table without history columns.
 /// - `results` - per-scenario medians with choices.
 fn printCommonTable(results: []const CommonBenchResult) void {
-    std.debug.print("common flat/tree/auto (ms/rep median, match: ok, MISS, - tie)\n", .{});
-    std.debug.print("{s:<24} {s:>10} {s:>10} {s:>10} {s:>6} {s:>5}\n", .{ "scenario", "flat", "tree", "auto", "choice", "match" });
+    std.debug.print("common flat/tree/auto (ms/rep median), predict (ms/call median); match: ok, MISS, - tie\n", .{});
+    std.debug.print("{s:<24} {s:>10} {s:>10} {s:>10} {s:>10} {s:>6} {s:>5}\n", .{ "scenario", "flat", "tree", "auto", "pred ms", "choice", "match" });
     for (results) |r| {
         const mark: []const u8 = if (r.tied) "-" else if (r.ok) "ok" else "MISS";
-        std.debug.print("{s:<24} {d:>10.3} {d:>10.3} {d:>10.3} {s:>6} {s:>5}\n", .{
+        std.debug.print("{s:<24} {d:>10.3} {d:>10.3} {d:>10.3} {d:>10.6} {s:>6} {s:>5}\n", .{
             r.name,
             r.ms[0],
             r.ms[1],
             r.ms[2],
+            r.predict_ms,
             if (r.choice_flat) "flat" else "tree",
             mark,
         });
@@ -894,9 +1013,9 @@ fn fillVeto(trees: []*Tree, inc_len: u32, alloc: Allocator, n: u32) !void {
 
 /// Builds, fills and benchmarks one common scenario end to end.
 /// - `io` - clock source for timing.
-/// - `alloc` - owns trees.
-/// - `name` - scenario label, static storage.
-/// - `n` - shared valid bits.
+/// - `alloc` - owns trees and the returned label.
+/// - `name_template` - scenario label with a `{n}` size placeholder.
+/// - `base_n` - shared valid bits before scaling.
 /// - `mode` - installed callback subset.
 /// - `fill` - scenario word distribution.
 ///
@@ -907,10 +1026,11 @@ fn benchCommonBuilt(
     comptime mode: CommonMode,
     io: std.Io,
     alloc: Allocator,
-    name: []const u8,
-    n: u32,
+    name_template: []const u8,
+    base_n: u32,
     fill: fn ([]*Tree, u32, Allocator, u32) anyerror!void,
 ) !CommonBenchResult {
+    const n = try scaledBits(base_n);
     var trees: [IL + EL]Tree = @splat(.{});
     defer {
         for (0..IL + EL) |k| trees[k].deinit(alloc);
@@ -923,6 +1043,8 @@ fn benchCommonBuilt(
     var exc: [EL]*Tree = undefined;
     for (0..IL) |k| inc[k] = &trees[k];
     for (0..EL) |k| exc[k] = &trees[IL + k];
+    const name = try commonScenarioName(alloc, name_template, n);
+    errdefer alloc.free(name);
     return benchCommonMode(IL, EL, mode, io, alloc, name, inc, exc, n);
 }
 
@@ -1096,7 +1218,29 @@ pub fn main(init: std.process.Init) !void {
     var arg_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
     defer arg_it.deinit();
     _ = arg_it.next();
-    const only: []const u8 = arg_it.next() orelse "all";
+    var only: []const u8 = "all";
+    var multiplier_arg: ?[]const u8 = null;
+    if (arg_it.next()) |first| {
+        if (std.mem.eql(u8, first, "all") or std.mem.eql(u8, first, "common") or std.mem.eql(u8, first, "classic")) {
+            only = first;
+            multiplier_arg = arg_it.next();
+        } else {
+            multiplier_arg = first;
+        }
+    }
+    if (multiplier_arg) |raw| {
+        iterations_multiplier = std.fmt.parseInt(u32, raw, 10) catch {
+            std.debug.print("error: iterations_multiplier must be a positive integer, got '{s}'\n", .{raw});
+            return error.InvalidIterationsMultiplier;
+        };
+        if (iterations_multiplier == 0) {
+            std.debug.print("error: iterations_multiplier must be at least 1\n", .{});
+            return error.InvalidIterationsMultiplier;
+        }
+    }
+    if (iterations_multiplier != 1) {
+        std.debug.print("iterations_multiplier: {d} (buffer sizes scaled)\n", .{iterations_multiplier});
+    }
     const run_classic = !std.mem.eql(u8, only, "common");
     const run_common = !std.mem.eql(u8, only, "classic");
 
@@ -1107,49 +1251,56 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (run_classic) {
+        const sparse_n = try scaledBits(1_000_000);
+        const dense_n = try scaledBits(100_000);
+        const strided_n = try scaledBits(200_000);
+        const ultra_n = try scaledBits(10_000_000);
+
         var sparse = Oracle{};
         defer sparse.deinit(alloc);
-        try sparse.resize(alloc, 1_000_000, .inactive);
+        try sparse.resize(alloc, sparse_n, .inactive);
         fillStride(&sparse, 997, 1);
 
         var dense = Oracle{};
         defer dense.deinit(alloc);
-        try dense.resize(alloc, 100_000, .active);
+        try dense.resize(alloc, dense_n, .active);
 
         var strided = Oracle{};
         defer strided.deinit(alloc);
-        try strided.resize(alloc, 200_000, .inactive);
+        try strided.resize(alloc, strided_n, .inactive);
         fillStride(&strided, 3, 0);
 
         var ultra = Oracle{};
         defer ultra.deinit(alloc);
-        try ultra.resize(alloc, 10_000_000, .inactive);
+        try ultra.resize(alloc, ultra_n, .inactive);
         fillStride(&ultra, 100_003, 7);
 
         var sparse_tree = Tree{};
         defer sparse_tree.deinit(alloc);
-        try sparse_tree.resize(alloc, 1_000_000, .inactive);
+        try sparse_tree.resize(alloc, sparse_n, .inactive);
         fillTreeStride(&sparse_tree, 997, 1);
 
         var dense_tree = Tree{};
         defer dense_tree.deinit(alloc);
-        try dense_tree.resize(alloc, 100_000, .active);
+        try dense_tree.resize(alloc, dense_n, .active);
 
         var strided_tree = Tree{};
         defer strided_tree.deinit(alloc);
-        try strided_tree.resize(alloc, 200_000, .inactive);
+        try strided_tree.resize(alloc, strided_n, .inactive);
         fillTreeStride(&strided_tree, 3, 0);
 
         var ultra_tree = Tree{};
         defer ultra_tree.deinit(alloc);
-        try ultra_tree.resize(alloc, 10_000_000, .inactive);
+        try ultra_tree.resize(alloc, ultra_n, .inactive);
         fillTreeStride(&ultra_tree, 100_003, 7);
 
-        try benchOne(io, alloc, &rows, "sparse1M", &sparse, &sparse_tree, .active, 500);
-        try benchOne(io, alloc, &rows, "sparse1M-inactive", &sparse, &sparse_tree, .inactive, 5);
-        try benchOne(io, alloc, &rows, "dense100k", &dense, &dense_tree, .active, 20);
-        try benchOne(io, alloc, &rows, "every3rd200k", &strided, &strided_tree, .active, 20);
-        try benchOne(io, alloc, &rows, "ultra10M", &ultra, &ultra_tree, .active, 200);
+        var name_buf: [64]u8 = undefined;
+        var nbuf: [16]u8 = undefined;
+        try benchOne(io, alloc, &rows, try classicLabel(&name_buf, &nbuf, "sparse1M", "sparse", "", sparse_n), &sparse, &sparse_tree, .active, 500);
+        try benchOne(io, alloc, &rows, try classicLabel(&name_buf, &nbuf, "sparse1M-inactive", "sparse", "-inactive", sparse_n), &sparse, &sparse_tree, .inactive, 5);
+        try benchOne(io, alloc, &rows, try classicLabel(&name_buf, &nbuf, "dense100k", "dense", "", dense_n), &dense, &dense_tree, .active, 20);
+        try benchOne(io, alloc, &rows, try classicLabel(&name_buf, &nbuf, "every3rd200k", "every3rd", "", strided_n), &strided, &strided_tree, .active, 20);
+        try benchOne(io, alloc, &rows, try classicLabel(&name_buf, &nbuf, "ultra10M", "ultra", "", ultra_n), &ultra, &ultra_tree, .active, 200);
 
         const strides = [_]u32{ 1, 2, 4, 8, 16, 64, 256, 1024, 4096, 16384, 65536 };
         for ([_]u32{1_000_000}) |total| {
@@ -1172,75 +1323,78 @@ pub fn main(init: std.process.Init) !void {
 
     if (run_common) {
         var common_results: std.ArrayListUnmanaged(CommonBenchResult) = .empty;
-        defer common_results.deinit(alloc);
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "uni-A-262k", 262144, fillUniA_UniI));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .inactive_only, io, alloc, "uni-I-262k", 262144, fillUniI_UniA));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "uni-I-Aonly-262k", 262144, fillUniI_UniA));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "sparse997-262k", 262144, fillStride997));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "single-bit-262k", 262144, fillSingleBit));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "alt-262k", 262144, fillAlternation));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .both, io, alloc, "alt-both-262k", 262144, fillAlternation));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "checker-262k", 262144, fillChecker));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "half-262k", 262144, fillHalf));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "veto-262k", 262144, fillVeto));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "veto-sparse-262k", 262144, fillVetoSparse));
-        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "holes-262k", 262144, fillHoles));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .inactive_only, io, alloc, "inact-heavy-262k", 262144, fillUniA_All));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "small130-alt", 130, fillAlternation));
-        try common_results.append(alloc, try benchCommonBuilt(3, 3, .active_only, io, alloc, "three-three-alt-262k", 262144, fillAlternation));
-        try common_results.append(alloc, try benchCommonBuilt(1, 0, .active_only, io, alloc, "one-zero-sparse-262k", 262144, fillStride997));
-        try common_results.append(alloc, try benchCommonBuilt(1, 0, .active_only, io, alloc, "1x0-half-100k", 100000, fillHalf));
-        try common_results.append(alloc, try benchCommonBuilt(0, 1, .active_only, io, alloc, "0x1-half-100k", 100000, fillHalf));
-        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "1x1-half-100k", 100000, fillHalf));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-half-100k", 100000, fillHalf));
-        try common_results.append(alloc, try benchCommonBuilt(1, 5, .active_only, io, alloc, "1x5-half-100k", 100000, fillHalf));
-        try common_results.append(alloc, try benchCommonBuilt(5, 1, .active_only, io, alloc, "5x1-half-100k", 100000, fillHalf));
-        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-half-100k", 100000, fillHalf));
-        try common_results.append(alloc, try benchCommonBuilt(10, 0, .active_only, io, alloc, "10x0-half-100k", 100000, fillHalf));
-        try common_results.append(alloc, try benchCommonBuilt(0, 10, .active_only, io, alloc, "0x10-half-100k", 100000, fillHalf));
-        try common_results.append(alloc, try benchCommonBuilt(3, 7, .active_only, io, alloc, "3x7-half-100k", 100000, fillHalf));
-        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-half-100k", 100000, fillHalf));
-        try common_results.append(alloc, try benchCommonBuilt(1, 0, .active_only, io, alloc, "1x0-veto-100k", 100000, fillVeto));
-        try common_results.append(alloc, try benchCommonBuilt(0, 1, .active_only, io, alloc, "0x1-veto-100k", 100000, fillVeto));
-        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "1x1-veto-100k", 100000, fillVeto));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-veto-100k", 100000, fillVeto));
-        try common_results.append(alloc, try benchCommonBuilt(1, 5, .active_only, io, alloc, "1x5-veto-100k", 100000, fillVeto));
-        try common_results.append(alloc, try benchCommonBuilt(5, 1, .active_only, io, alloc, "5x1-veto-100k", 100000, fillVeto));
-        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-veto-100k", 100000, fillVeto));
-        try common_results.append(alloc, try benchCommonBuilt(10, 0, .active_only, io, alloc, "10x0-veto-100k", 100000, fillVeto));
-        try common_results.append(alloc, try benchCommonBuilt(0, 10, .active_only, io, alloc, "0x10-veto-100k", 100000, fillVeto));
-        try common_results.append(alloc, try benchCommonBuilt(3, 7, .active_only, io, alloc, "3x7-veto-100k", 100000, fillVeto));
-        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-veto-100k", 100000, fillVeto));
-        try common_results.append(alloc, try benchCommonBuilt(1, 0, .active_only, io, alloc, "1x0-sparse-100k", 100000, fillStride997));
-        try common_results.append(alloc, try benchCommonBuilt(0, 1, .active_only, io, alloc, "0x1-sparse-100k", 100000, fillStride997));
-        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "1x1-sparse-100k", 100000, fillStride997));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-sparse-100k", 100000, fillStride997));
-        try common_results.append(alloc, try benchCommonBuilt(1, 5, .active_only, io, alloc, "1x5-sparse-100k", 100000, fillStride997));
-        try common_results.append(alloc, try benchCommonBuilt(5, 1, .active_only, io, alloc, "5x1-sparse-100k", 100000, fillStride997));
-        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-sparse-100k", 100000, fillStride997));
-        try common_results.append(alloc, try benchCommonBuilt(10, 0, .active_only, io, alloc, "10x0-sparse-100k", 100000, fillStride997));
-        try common_results.append(alloc, try benchCommonBuilt(0, 10, .active_only, io, alloc, "0x10-sparse-100k", 100000, fillStride997));
-        try common_results.append(alloc, try benchCommonBuilt(3, 7, .active_only, io, alloc, "3x7-sparse-100k", 100000, fillStride997));
-        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-sparse-100k", 100000, fillStride997));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-checker-100k", 100000, fillChecker));
-        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-checker-100k", 100000, fillChecker));
-        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-checker-100k", 100000, fillChecker));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-disjoint-100k", 100000, fillDisjoint));
-        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-disjoint-100k", 100000, fillDisjoint));
-        try common_results.append(alloc, try benchCommonBuilt(3, 7, .active_only, io, alloc, "3x7-disjoint-100k", 100000, fillDisjoint));
-        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-disjoint-100k", 100000, fillDisjoint));
-        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-uni-A-100k", 100000, fillUniA_UniI));
-        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-uni-A-100k", 100000, fillUniA_UniI));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-single-100k", 100000, fillSingleBit));
-        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-single-100k", 100000, fillSingleBit));
-        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "1x1-holes-100k", 100000, fillHoles));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-holes-100k", 100000, fillHoles));
-        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-holes-100k", 100000, fillHoles));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .inactive_only, io, alloc, "2x2-half-I-100k", 100000, fillHalf));
-        try common_results.append(alloc, try benchCommonBuilt(5, 5, .inactive_only, io, alloc, "5x5-half-I-100k", 100000, fillHalf));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .inactive_only, io, alloc, "2x2-checker-I-100k", 100000, fillCheckerInactive));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .both, io, alloc, "2x2-alt-both-100k", 100000, fillAlternation));
-        try common_results.append(alloc, try benchCommonBuilt(2, 2, .both, io, alloc, "2x2-half-both-100k", 100000, fillHalf));
+        defer {
+            for (common_results.items) |result| alloc.free(result.name);
+            common_results.deinit(alloc);
+        }
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "uni-A-{n}", 262144, fillUniA_UniI));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .inactive_only, io, alloc, "uni-I-{n}", 262144, fillUniI_UniA));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "uni-I-Aonly-{n}", 262144, fillUniI_UniA));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "sparse997-{n}", 262144, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "single-bit-{n}", 262144, fillSingleBit));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "alt-{n}", 262144, fillAlternation));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .both, io, alloc, "alt-both-{n}", 262144, fillAlternation));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "checker-{n}", 262144, fillChecker));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "half-{n}", 262144, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "veto-{n}", 262144, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "veto-sparse-{n}", 262144, fillVetoSparse));
+        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "holes-{n}", 262144, fillHoles));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .inactive_only, io, alloc, "inact-heavy-{n}", 262144, fillUniA_All));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "small{n}-alt", 130, fillAlternation));
+        try common_results.append(alloc, try benchCommonBuilt(3, 3, .active_only, io, alloc, "three-three-alt-{n}", 262144, fillAlternation));
+        try common_results.append(alloc, try benchCommonBuilt(1, 0, .active_only, io, alloc, "one-zero-sparse-{n}", 262144, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(1, 0, .active_only, io, alloc, "1x0-half-{n}", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(0, 1, .active_only, io, alloc, "0x1-half-{n}", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "1x1-half-{n}", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-half-{n}", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(1, 5, .active_only, io, alloc, "1x5-half-{n}", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(5, 1, .active_only, io, alloc, "5x1-half-{n}", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-half-{n}", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(10, 0, .active_only, io, alloc, "10x0-half-{n}", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(0, 10, .active_only, io, alloc, "0x10-half-{n}", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(3, 7, .active_only, io, alloc, "3x7-half-{n}", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-half-{n}", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(1, 0, .active_only, io, alloc, "1x0-veto-{n}", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(0, 1, .active_only, io, alloc, "0x1-veto-{n}", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "1x1-veto-{n}", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-veto-{n}", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(1, 5, .active_only, io, alloc, "1x5-veto-{n}", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(5, 1, .active_only, io, alloc, "5x1-veto-{n}", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-veto-{n}", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(10, 0, .active_only, io, alloc, "10x0-veto-{n}", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(0, 10, .active_only, io, alloc, "0x10-veto-{n}", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(3, 7, .active_only, io, alloc, "3x7-veto-{n}", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-veto-{n}", 100000, fillVeto));
+        try common_results.append(alloc, try benchCommonBuilt(1, 0, .active_only, io, alloc, "1x0-sparse-{n}", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(0, 1, .active_only, io, alloc, "0x1-sparse-{n}", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "1x1-sparse-{n}", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-sparse-{n}", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(1, 5, .active_only, io, alloc, "1x5-sparse-{n}", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(5, 1, .active_only, io, alloc, "5x1-sparse-{n}", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-sparse-{n}", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(10, 0, .active_only, io, alloc, "10x0-sparse-{n}", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(0, 10, .active_only, io, alloc, "0x10-sparse-{n}", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(3, 7, .active_only, io, alloc, "3x7-sparse-{n}", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-sparse-{n}", 100000, fillStride997));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-checker-{n}", 100000, fillChecker));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-checker-{n}", 100000, fillChecker));
+        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-checker-{n}", 100000, fillChecker));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-disjoint-{n}", 100000, fillDisjoint));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-disjoint-{n}", 100000, fillDisjoint));
+        try common_results.append(alloc, try benchCommonBuilt(3, 7, .active_only, io, alloc, "3x7-disjoint-{n}", 100000, fillDisjoint));
+        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-disjoint-{n}", 100000, fillDisjoint));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-uni-A-{n}", 100000, fillUniA_UniI));
+        try common_results.append(alloc, try benchCommonBuilt(10, 10, .active_only, io, alloc, "10x10-uni-A-{n}", 100000, fillUniA_UniI));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-single-{n}", 100000, fillSingleBit));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-single-{n}", 100000, fillSingleBit));
+        try common_results.append(alloc, try benchCommonBuilt(1, 1, .active_only, io, alloc, "1x1-holes-{n}", 100000, fillHoles));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .active_only, io, alloc, "2x2-holes-{n}", 100000, fillHoles));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .active_only, io, alloc, "5x5-holes-{n}", 100000, fillHoles));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .inactive_only, io, alloc, "2x2-half-I-{n}", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(5, 5, .inactive_only, io, alloc, "5x5-half-I-{n}", 100000, fillHalf));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .inactive_only, io, alloc, "2x2-checker-I-{n}", 100000, fillCheckerInactive));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .both, io, alloc, "2x2-alt-both-{n}", 100000, fillAlternation));
+        try common_results.append(alloc, try benchCommonBuilt(2, 2, .both, io, alloc, "2x2-half-both-{n}", 100000, fillHalf));
         printCommonTable(common_results.items);
     }
 
