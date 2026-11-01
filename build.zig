@@ -7,7 +7,7 @@ pub const Options = struct {
     target: ?std.Build.ResolvedTarget = null,
     /// The optimization mode used to compile the module.
     optimize: ?std.lang.Optimize = null,
-
+    dependency_bit_word: ?*std.Build.Module = null,
     pub fn initFromOptions(b: *std.Build) Options {
         return .{
             .target = b.standardTargetOptions(.{}),
@@ -33,11 +33,17 @@ pub const Options = struct {
             .target = target,
             .optimize = optimize,
         });
-        return b.createModule(.{
+        const bit_word_mod = self.dependency_bit_word orelse self_dep.builder.dependency("bit_word", .{
+            .target = target,
+            .optimize = optimize,
+        }).module("bit_word");
+        const mod = b.createModule(.{
             .root_source_file = self_dep.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
         });
+        mod.addImport("bit_word", bit_word_mod);
+        return mod;
     }
 };
 
@@ -46,11 +52,17 @@ pub const Options = struct {
 fn createModuleOwn(b: *std.Build, options: Options) *std.Build.Module {
     const target = options.target orelse b.standardTargetOptions(.{});
     const optimize = options.optimize orelse b.standardOptimizeOption(.{});
-    return b.addModule("bit_tree", .{
+    const bit_word_mod = options.dependency_bit_word orelse b.dependency("bit_word", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("bit_word");
+    const mod = b.addModule("bit_tree", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    mod.addImport("bit_word", bit_word_mod);
+    return mod;
 }
 
 /// Configures library modules, unit tests and the tree benchmark.
@@ -61,13 +73,12 @@ pub fn build(b: *std.Build) void {
     const optimize = options.optimize orelse b.standardOptimizeOption(.{});
 
     const mod = createModuleOwn(b, options);
-    _ = mod;
+    const bit_word_mod = mod.import_table.get("bit_word").?;
 
     const test_step = b.step("test", "Run unit tests");
     for ([_][]const u8{
         "src/bitset.zig",
         "src/layer.zig",
-        "src/bit_word.zig",
         "src/bit_tree.zig",
     }) |src| {
         const unit_tests = b.addTest(.{
@@ -75,6 +86,9 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(src),
                 .target = target,
                 .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "bit_word", .module = bit_word_mod },
+                },
             }),
         });
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
@@ -86,6 +100,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/bench_bit_tree.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "bit_word", .module = bit_word_mod },
+            },
         }),
     });
 

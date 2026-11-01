@@ -1,13 +1,13 @@
 const std = @import("std");
 const utilities = @import("utilities.zig");
-const bit_word = @import("bit_word.zig");
+const bit_word = @import("bit_word").bit_word;
 const Allocator = std.mem.Allocator;
 const ListA64 = utilities.ListA64;
 
 const InlineIteratorCallback = utilities.InlineIteratorCallback;
 const iterateActiveBitsInWordInline = utilities.iterateActiveBitsInWordInline;
 const BitRange = utilities.BitRange;
-const BitState = utilities.BitState;
+const BitState = bit_word.BitState;
 const WordType = bit_word.WordType;
 
 /// Flat bitset with word storage and exact active-bit counts.

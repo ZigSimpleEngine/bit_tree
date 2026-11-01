@@ -3,7 +3,11 @@
     .version = "0.0.1",
     .fingerprint = 0x5548e79411b36512,
     .minimum_zig_version = "0.17.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .bit_word = .{
+            .path = "../bit_word",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

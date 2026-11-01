@@ -3,7 +3,7 @@ pub const bitset = @import("bitset.zig");
 /// Pyramid summary level with activity and mixed planes.
 pub const layer = @import("layer.zig");
 /// Compile-time word arithmetic kit for all widths.
-pub const bit_word = @import("bit_word.zig");
+pub const bit_word = @import("bit_word").bit_word;
 /// Shared aliases, callbacks and small helpers.
 pub const utilities = @import("utilities.zig");
 /// Hierarchical bit tree with flat/tree iteration choice.

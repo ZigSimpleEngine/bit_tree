@@ -1,7 +1,7 @@
 const std = @import("std");
 const math = std.math;
 const utilities = @import("utilities.zig");
-const bit_word = @import("bit_word.zig");
+const bit_word = @import("bit_word").bit_word;
 const Allocator = std.mem.Allocator;
 const ListA64 = utilities.ListA64;
 
@@ -9,7 +9,7 @@ const IteratorCallback = utilities.IteratorCallback;
 const InlineIteratorCallback = utilities.InlineIteratorCallback;
 const iterateWord = utilities.iterateActiveBitsInWord;
 const iterateWordInline = utilities.iterateActiveBitsInWordInline;
-const BitState = utilities.BitState;
+const BitState = bit_word.BitState;
 const WordType = bit_word.WordType;
 
 /// Pyramid level that summarizes one bit plane into activity and mixed planes.

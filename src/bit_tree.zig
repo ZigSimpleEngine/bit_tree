@@ -1,13 +1,13 @@
 const std = @import("std");
 const utilities = @import("utilities.zig");
-const bit_word = @import("bit_word.zig");
+const bit_word = @import("bit_word").bit_word;
 const Bitset = @import("bitset.zig").Bitset;
 const Layer = @import("layer.zig").Layer;
 
 const InlineIteratorCallback = utilities.InlineIteratorCallback;
 const Allocator = std.mem.Allocator;
 const ListA64 = utilities.ListA64;
-const BitState = utilities.BitState;
+const BitState = bit_word.BitState;
 const WordType = bit_word.WordType;
 
 /// Forces the iteration path instead of auto prediction.

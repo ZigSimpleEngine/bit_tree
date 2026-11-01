@@ -1,5 +1,5 @@
 const std = @import("std");
-const bit_word = @import("bit_word.zig");
+const bit_word = @import("bit_word").bit_word;
 const WordType = bit_word.WordType;
 
 /// Largest representable u64, used as an unbounded limit for iteration cursors.
@@ -128,31 +128,4 @@ pub const BitRange = struct {
     len: u32,
     /// Pyramid level the span belongs to, selects the backing plane.
     layer: u32,
-};
-
-/// Single-bit logical value shared by bitsets, layers and trees.
-pub const BitState = enum(u1) {
-    const Self = @This();
-
-    /// Cleared bit, skipped by active-only iteration.
-    inactive = 0,
-    /// Set bit, visited by active-only iteration.
-    active = 1,
-
-    /// Expands one logical state into a fully filled backing word.
-    /// - `self` - state to replicate across all word bits.
-    /// - `wt` - word width that defines the result integer type.
-    ///
-    /// Return - word with all bits cleared or all bits set.
-    pub inline fn toWordState(self: Self, comptime wt: WordType) wt.Type() {
-        return 0 -% @as(wt.Type(), @backingInt(self));
-    }
-
-    /// Converts the state into a plain boolean for branch conditions.
-    /// - `self` - state to test for activity.
-    ///
-    /// Return - true for active, false for inactive.
-    pub inline fn asBool(self: Self) bool {
-        return self == .active;
-    }
 };
